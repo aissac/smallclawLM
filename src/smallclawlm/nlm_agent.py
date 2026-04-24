@@ -1,61 +1,27 @@
-"""NLMAgent — Pre-configured smolagents CodeAgent with NotebookLM as the brain.
+"""NLMAgent - Pre-configured smolagents CodeAgent with NotebookLM as the brain.
 
-This is the main entry point: a ready-to-use agent that thinks using
-NotebookLM's Gemini and acts using NotebookLM's APIs.
+IMPORTANT: Must use CodeAgent, NOT ToolCallingAgent.
+NotebookLM cannot return structured JSON tool calls - it outputs Python code.
+CodeAgent parses Python code blocks from the model output.
 """
 
 import logging
 from typing import Any
-
 from smolagents import CodeAgent
-
 from smallclawlm.nlm_model import NLMModel
-from smallclawlm.nlm_tools import (
-    DeepResearchTool,
-    GeneratePodcastTool,
-    GenerateVideoTool,
-    GenerateQuizTool,
-    GenerateFlashcardsTool,
-    GenerateMindMapTool,
-    GenerateReportTool,
-    AddSourceTool,
-    ListSourcesTool,
-    CreateNotebookTool,
-    DedupSourcesTool,
-)
+from smallclawlm.nlm_tools import DEFAULT_TOOLS
 
 logger = logging.getLogger(__name__)
-
-# Default set of tools for the agent
-DEFAULT_TOOLS = [
-    DeepResearchTool,
-    GeneratePodcastTool,
-    GenerateVideoTool,
-    GenerateQuizTool,
-    GenerateFlashcardsTool,
-    GenerateMindMapTool,
-    GenerateReportTool,
-    AddSourceTool,
-    ListSourcesTool,
-    CreateNotebookTool,
-    DedupSourcesTool,
-]
 
 
 class NLMAgent:
     """Zero-token AI agent powered by Google NotebookLM.
 
-    Uses NotebookLM's Gemini as the reasoning engine and NotebookLM's
-    APIs as actions. No external LLM API keys needed.
+    Uses NotebookLM Gemini as reasoning engine + NotebookLM APIs as actions.
+    No external LLM API keys needed.
 
-    Args:
-        model: smolagents Model instance. Defaults to NLMModel.
-        notebook_id: NotebookLM notebook ID to use.
-        notebook_title: Title for auto-created notebooks.
-        tools: List of Tool classes to provide. Defaults to all NLM tools.
-        additional_tools: Extra tools to add beyond defaults.
-        max_steps: Maximum agent reasoning steps.
-        verbosity_level: Logging verbosity (0-2).
+    Uses CodeAgent (not ToolCallingAgent) because NotebookLM outputs
+    Python code blocks, not structured JSON tool calls.
     """
 
     def __init__(
@@ -68,7 +34,6 @@ class NLMAgent:
         max_steps: int = 20,
         verbosity_level: int = 1,
     ):
-        # Default to NLMModel (zero external tokens!)
         if model is None:
             model = NLMModel(
                 notebook_id=notebook_id,
@@ -76,7 +41,6 @@ class NLMAgent:
                 auto_create=True,
             )
 
-        # Instantiate tool classes
         tool_classes = tools or DEFAULT_TOOLS
         tool_instances = [cls() for cls in tool_classes]
 
@@ -91,13 +55,6 @@ class NLMAgent:
         )
 
     def run(self, task: str, **kwargs) -> str:
-        """Run the agent on a task.
-
-        Args:
-            task: Natural language task description.
-
-        Returns:
-            Agent's final answer.
-        """
+        """Run the agent on a task."""
         logger.info(f"Starting NLMAgent with task: {task[:100]}...")
         return self.agent.run(task, **kwargs)

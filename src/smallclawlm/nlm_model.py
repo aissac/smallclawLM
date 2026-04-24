@@ -1,34 +1,45 @@
-"""NLMModel — smolagents Model backed by NotebookLM chat API.
+"""NLMModel - smolagents Model backed by NotebookLM chat API.
 
-This is the core of SmallClawLM: a smolagents-compatible Model that routes
-all LLM calls through NotebookLM's built-in Gemini, requiring zero external
-API tokens for the agent's "thinking."
+The core of SmallClawLM: routes all LLM calls through NotebookLM's built-in Gemini.
+Zero external API tokens needed.
+
+Architecture (per smolagents integration analysis):
+- Daemon thread event loop via run_coroutine_threadsafe (NOT asyncio.run)
+- Never reuses conversation_id - each generate() call is stateless
+- Handles stop_sequences (truncate before Observation: markers)
+- CodeAgent ONLY - NotebookLM can't return structured JSON tool calls
+- Forces coding persona so NotebookLM outputs Python code blocks
+- Returns dummy TokenUsage (NotebookLM doesn't expose token counts)
 """
 
 import asyncio
 import logging
+import threading
 from typing import Any
 
-from smolagents.models import Model, ChatMessage, MessageRole
+from smolagents.models import ChatMessage, MessageRole, Model
+from smolagents.monitoring import TokenUsage
 
-from smallclawlm.auth import get_auth, ensure_authenticated
+from smallclawlm.auth import get_auth
 
 logger = logging.getLogger(__name__)
 
+_CODING_PERSONA_PREFIX = (
+    "You are an autonomous coding agent. When asked to act, you MUST output "
+    "Python code inside ```python ... ``` code blocks. "
+    "Do not just summarize or explain - write executable code. "
+    "If you need to use a tool, write Python code that calls it. "
+)
+
 
 class NLMModel(Model):
-    """smolagents Model that uses NotebookLM's chat API as the LLM backend.
+    """smolagents Model using NotebookLM's chat API as the LLM backend.
 
-    All agent reasoning is powered by Gemini inside Google's NotebookLM.
+    All agent reasoning powered by Gemini inside Google's NotebookLM.
     No external LLM API keys required.
 
-    Args:
-        notebook_id: NotebookLM notebook ID to use as context.
-            If None, uses the most recent notebook or creates one.
-        notebook_title: Title for auto-created notebooks.
-        auto_create: Whether to auto-create notebooks when needed.
-        language: Response language (default: "en").
-        model_id: Display name for smolagents (default: "notebooklm-gemini").
+    Uses shared daemon event loop for async/sync bridging.
+    Each generate() call is stateless (no conversation_id reuse).
     """
 
     def __init__(
@@ -36,7 +47,7 @@ class NLMModel(Model):
         notebook_id: str | None = None,
         notebook_title: str | None = None,
         auto_create: bool = True,
-        language: str = "en",
+        inject_coding_persona: bool = True,
         model_id: str = "notebooklm-gemini",
         **kwargs,
     ):
@@ -44,34 +55,36 @@ class NLMModel(Model):
         self._notebook_id = notebook_id
         self._notebook_title = notebook_title or "SmallClawLM Session"
         self._auto_create = auto_create
-        self._language = language
+        self._inject_coding_persona = inject_coding_persona
         self.model_id = model_id
+
+        # Daemon event loop for async/sync bridging
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+
         self._client = None
         self._auth = None
 
+    def _run_async(self, coro):
+        """Submit async coroutine to daemon loop, blocking until done."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
     async def _ensure_client(self):
-        """Lazily initialize the NotebookLM client."""
         if self._client is not None:
             return
-
         from notebooklm import NotebookLMClient
-
         self._auth = await get_auth()
         self._client = NotebookLMClient(self._auth)
+        await self._client.__aenter__()
 
     async def _ensure_notebook(self):
-        """Ensure we have a notebook ID, creating one if needed."""
         await self._ensure_client()
-
         if self._notebook_id is not None:
             return
-
         if not self._auto_create:
-            raise ValueError(
-                "No notebook_id provided and auto_create=False. "
-                "Either pass a notebook_id or set auto_create=True."
-            )
-
+            raise ValueError("No notebook_id provided and auto_create=False.")
         nb = await self._client.notebooks.create(self._notebook_title)
         self._notebook_id = nb.id
         logger.info(f"Auto-created notebook: {nb.id} ({nb.title})")
@@ -79,53 +92,56 @@ class NLMModel(Model):
     def generate(
         self,
         messages: list[ChatMessage],
-        tools: list[Any] | None = None,
+        stop_sequences: list[str] | None = None,
+        response_format: dict[str, str] | None = None,
+        tools_to_call_from: list[Any] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        """Generate a response using NotebookLM's chat API.
-
-        Converts smolagents message history into a single prompt for NotebookLM.
-        The agent's entire reasoning loop runs through Gemini inside Google.
-        """
-        return asyncio.get_event_loop().run_until_complete(
-            self._agenerate(messages, tools, **kwargs)
-        )
+        """Generate a response using NotebookLM chat API. Stateless per call."""
+        return self._run_async(self._agenerate(messages, stop_sequences, **kwargs))
 
     async def _agenerate(
         self,
         messages: list[ChatMessage],
-        tools: list[Any] | None = None,
+        stop_sequences: list[str] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        """Async implementation of generate."""
         await self._ensure_notebook()
 
-        # Convert smolagents messages to a single prompt
+        # Flatten smolagents history into single prompt (NO conversation_id)
         prompt = self._messages_to_prompt(messages)
 
-        # Query NotebookLM — Gemini inside Google does the thinking
-        result = await self._client.chat.ask(
-            self._notebook_id,
-            prompt,
-        )
+        if self._inject_coding_persona:
+            prompt = _CODING_PERSONA_PREFIX + prompt
+
+        try:
+            result = await self._client.chat.ask(self._notebook_id, prompt)
+            content = result.answer if hasattr(result, "answer") else str(result)
+        except Exception as e:
+            logger.warning(f"NotebookLM chat error: {e}")
+            content = f"NotebookLM Error: {e}"
+
+        if stop_sequences:
+            from smolagents.models import remove_content_after_stop_sequences
+            content = remove_content_after_stop_sequences(content, stop_sequences)
 
         return ChatMessage(
             role=MessageRole.ASSISTANT,
-            content=result.answer if hasattr(result, "answer") else str(result),
+            content=content,
+            token_usage=TokenUsage(input_tokens=0, output_tokens=0),
         )
 
     def _messages_to_prompt(self, messages: list[ChatMessage]) -> str:
-        """Convert smolagents message history into a NotebookLM-compatible prompt."""
+        role_labels = {
+            MessageRole.SYSTEM: "System",
+            MessageRole.USER: "User",
+            MessageRole.ASSISTANT: "Assistant",
+            MessageRole.TOOL_CALL: "Tool Call",
+            MessageRole.TOOL_RESPONSE: "Tool Result",
+        }
         parts = []
         for msg in messages:
-            if msg.role == MessageRole.SYSTEM:
-                parts.append(f"[System]: {msg.content}")
-            elif msg.role == MessageRole.USER:
-                parts.append(f"[User]: {msg.content}")
-            elif msg.role == MessageRole.ASSISTANT:
-                parts.append(f"[Assistant]: {msg.content}")
-            elif msg.role == MessageRole.TOOL_CALL:
-                parts.append(f"[Tool Call]: {msg.content}")
-            elif msg.role == MessageRole.TOOL_RESPONSE:
-                parts.append(f"[Tool Result]: {msg.content}")
+            label = role_labels.get(msg.role, str(msg.role))
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            parts.append(f"[{label}]: {content}")
         return "\n\n".join(parts)
