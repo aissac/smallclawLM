@@ -12,15 +12,17 @@ Usage:
     agent = NLMAgent(notebook_id="xyz789", tools="podcast")
     result = agent.run("Create a podcast about climate change")
 
-    # Custom tool set
-    agent = NLMAgent(notebook_id="abc123", tools=[AskNotebookTool, AddSourceTool])
+    # Custom tool set + system prompt
+    agent = NLMAgent(
+        notebook_id="abc123",
+        tools=[AskNotebookTool, AddSourceTool],
+        instructions="You are a marine biology expert. Focus on ocean ecosystems.",
+    )
 """
 
 import logging
-from pathlib import Path
-from typing import Any
-
 from smolagents import CodeAgent
+from smolagents.agents import PromptTemplates
 
 from smallclawlm.nlm_model import NLMModel
 from smallclawlm.nlm_tools import (
@@ -39,6 +41,15 @@ TOOL_PRESETS = {
     "all": ALL_TOOLS,
 }
 
+DEFAULT_SYSTEM_PROMPT = """You are a SmallClawLM agent powered by Google NotebookLM.
+You have access to notebook tools for research, content generation, and analysis.
+
+IMPORTANT RULES:
+1. Use tools to gather information before answering.
+2. When you have enough information, call final_answer() with your complete response.
+3. If a tool returns an error, read the suggested fix and try again.
+4. Always call final_answer() when done — it is the ONLY way to end execution."""
+
 
 class NLMAgent:
     """One agent, one notebook, one specialty.
@@ -55,7 +66,9 @@ class NLMAgent:
         notebook_id: str | None = None,
         notebook_title: str | None = None,
         tools: str | list[type] = "all",
+        instructions: str | None = None,
         additional_authorized_imports: list[str] | None = None,
+        planning_interval: int | None = None,
         max_steps: int = 10,
         verbosity_level: int = 1,
         upload_sources: list[str] | None = None,
@@ -79,12 +92,23 @@ class NLMAgent:
             concise=True,
         )
 
+        # Build prompt templates with optional custom instructions
+        system_prompt = instructions or DEFAULT_SYSTEM_PROMPT
+        prompt_templates = PromptTemplates(
+            system_prompt=system_prompt,
+            planning={"initial_plan": "", "update_plan_pre": "", "update_plan_post": ""},
+            managed_agent={"task": "", "report": ""},
+            final_answer={"pre_messages": "", "post_messages": ""},
+        )
+
         self.agent = CodeAgent(
             model=model,
             tools=tool_instances,
+            prompt_templates=prompt_templates,
             max_steps=max_steps,
             verbosity_level=verbosity_level,
             additional_authorized_imports=additional_authorized_imports or [],
+            planning_interval=planning_interval,
         )
 
         # Share notebook_id with tools so they operate on the same notebook
@@ -93,11 +117,8 @@ class NLMAgent:
 
     def _share_notebook_id(self):
         """Propagate notebook_id to all tool instances after model creates notebook."""
-        # Ensure model has initialized its notebook
         if self._notebook_id:
             self._model._notebook_id = self._notebook_id
-
-        # Set notebook_id on tool instances that support it
         for tool in self.agent.tools:
             if hasattr(tool, '_notebook_id'):
                 tool._notebook_id = self._notebook_id
@@ -145,7 +166,7 @@ def create_agent(
 
     Args:
         specialty: One of "research", "podcast", "quiz", "report", "mindmap"
-        notebook_id:_existing notebook ID (auto-creates if None)
+        notebook_id: Existing notebook ID (auto-creates if None)
         **kwargs: Additional args passed to NLMAgent
 
     Returns:
