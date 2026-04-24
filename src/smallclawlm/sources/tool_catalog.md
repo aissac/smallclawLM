@@ -96,10 +96,10 @@ Create a new NotebookLM notebook.
 
 ## Direct Response
 
-### direct_response(content)
+### final_answer(content)
 Respond directly to the user without using any tool. Use this when you have enough information to answer.
 - **content** (str): Your response to the user.
 - Example:
   ```python
-  direct_response(content="Based on my research, fusion energy has made significant progress in three key areas...")
+  final_answer(content="Based on my research, fusion energy has made significant progress in three key areas...")
   ```

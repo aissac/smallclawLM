@@ -66,16 +66,13 @@ def agent(notebook_id, specialty, max_steps, verbose):
 
     while True:
         try:
-            task = click.prompt("
-Task")
+            task = click.prompt("Task")
             if task.strip().lower() in ("exit", "quit", "q"):
                 break
             result = nlm_agent.run(task)
-            click.echo(f"
-{result}")
+            click.echo(result)
         except KeyboardInterrupt:
-            click.echo("
-Bye!")
+            click.echo("Bye!")
             break
 
 

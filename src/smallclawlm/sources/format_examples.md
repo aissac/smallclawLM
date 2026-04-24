@@ -65,7 +65,7 @@ User message: "What is 2 + 2?"
 The answer is straightforward and doesn't require any tools.
 
 ```python
-direct_response(content="2 + 2 equals 4.")
+final_answer(content="2 + 2 equals 4.")
 ```
 
 ## Example 6: Error Recovery
@@ -86,5 +86,5 @@ ask_notebook(question="What information is available about underwater basket wea
 2. The code block contains EXACTLY ONE function call.
 3. Always use double quotes for string parameters.
 4. Never write "```python" inside another code block.
-5. If you know the answer without tools, use direct_response().
+5. If you know the answer without tools, use final_answer().
 6. If a tool fails, try a different approach — do not repeat the same call.

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from smallclawlm.nlm_tools import (
     DeepResearchTool, AskNotebookTool, GeneratePodcastTool,
     AddSourceTool, ListSourcesTool, CreateNotebookTool,
-    DirectResponseTool, ALL_TOOLS, RESEARCH_TOOLS, PODCAST_TOOLS,
+    FinalAnswerTool, ALL_TOOLS, RESEARCH_TOOLS, PODCAST_TOOLS,
     _SharedLoop, _ClientMixin,
 )
 
@@ -21,29 +21,29 @@ class TestToolPresets:
     def test_podcast_tools_count(self):
         assert len(PODCAST_TOOLS) == 4
 
-    def test_direct_response_in_all(self):
+    def test_final_answer_in_all(self):
         tool_classes = ALL_TOOLS
-        assert DirectResponseTool in tool_classes
+        assert FinalAnswerTool in tool_classes
 
     def test_research_has_no_podcast(self):
         assert GeneratePodcastTool not in RESEARCH_TOOLS
 
 
-class TestDirectResponseTool:
+class TestFinalAnswerTool:
     """The only tool we can test without mocking — no async API calls."""
 
     def test_forward_returns_content(self):
-        tool = DirectResponseTool()
+        tool = FinalAnswerTool()
         result = tool.forward(content="Hello world")
         assert result == "Hello world"
 
     def test_forward_empty_content(self):
-        tool = DirectResponseTool()
+        tool = FinalAnswerTool()
         result = tool.forward(content="")
         assert result == ""
 
     def test_tool_name(self):
-        assert DirectResponseTool.name == "direct_response"
+        assert FinalAnswerTool.name == "final_answer"
 
 
 class TestToolSMolagentsInterface:
