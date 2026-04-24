@@ -1,20 +1,20 @@
-"""NLMModel - smolagents Model backed by NotebookLM chat API.
+"""NLMModel — smolagents Model backed by a single NotebookLM notebook.
 
-The core of SmallClawLM: routes all LLM calls through NotebookLM's built-in Gemini.
-Zero external API tokens needed.
+One agent = one notebook = one specialty brain.
+The model calls chat.ask() on its notebook for every generate() call.
 
-Architecture (per smolagents integration analysis):
-- Daemon thread event loop via run_coroutine_threadsafe (NOT asyncio.run)
-- Never reuses conversation_id - each generate() call is stateless
-- Handles stop_sequences (truncate before Observation: markers)
-- CodeAgent ONLY - NotebookLM can't return structured JSON tool calls
-- Forces coding persona so NotebookLM outputs Python code blocks
-- Returns dummy TokenUsage (NotebookLM doesn't expose token counts)
+Key design decisions (validated with NotebookLM):
+- Stateless chat: conversation_id=None (smolagents manages its own history)
+- ChatMode.CONCISE: shorter responses = faster agent loops
+- Exponential backoff: handle ChatError rate limits gracefully
+- Auth refresh: auto-recover from expired tokens via refresh_auth()
+- Source wait: tools must wait for source processing before next generate()
 """
 
 import asyncio
 import logging
 import threading
+import time
 from typing import Any
 
 from smolagents.models import ChatMessage, MessageRole, Model
@@ -24,22 +24,17 @@ from smallclawlm.auth import get_auth
 
 logger = logging.getLogger(__name__)
 
-_CODING_PERSONA_PREFIX = (
-    "You are an autonomous coding agent. When asked to act, you MUST output "
-    "Python code inside ```python ... ``` code blocks. "
-    "Do not just summarize or explain - write executable code. "
-    "If you need to use a tool, write Python code that calls it. "
-)
+# Retry config for rate limits
+_MAX_RETRIES = 3
+_RETRY_DELAYS = (2, 4, 8)
 
 
 class NLMModel(Model):
-    """smolagents Model using NotebookLM's chat API as the LLM backend.
+    """smolagents Model using a single NotebookLM notebook as the LLM backend.
 
-    All agent reasoning powered by Gemini inside Google's NotebookLM.
+    Each agent gets one notebook with its own domain sources.
+    All reasoning powered by Gemini inside Google's NotebookLM.
     No external LLM API keys required.
-
-    Uses shared daemon event loop for async/sync bridging.
-    Each generate() call is stateless (no conversation_id reuse).
     """
 
     def __init__(
@@ -47,15 +42,15 @@ class NLMModel(Model):
         notebook_id: str | None = None,
         notebook_title: str | None = None,
         auto_create: bool = True,
-        inject_coding_persona: bool = True,
+        concise: bool = True,
         model_id: str = "notebooklm-gemini",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._notebook_id = notebook_id
-        self._notebook_title = notebook_title or "SmallClawLM Session"
+        self._notebook_title = notebook_title or "SmallClawLM Agent"
         self._auto_create = auto_create
-        self._inject_coding_persona = inject_coding_persona
+        self._concise = concise
         self.model_id = model_id
 
         # Daemon event loop for async/sync bridging
@@ -72,14 +67,26 @@ class NLMModel(Model):
         return future.result()
 
     async def _ensure_client(self):
+        """Get or create the NotebookLM client and notebook."""
         if self._client is not None:
             return
+
         from notebooklm import NotebookLMClient
         self._auth = await get_auth()
         self._client = NotebookLMClient(self._auth)
         await self._client.__aenter__()
 
+        # Set concise mode for faster agent loops
+        if self._concise:
+            try:
+                from notebooklm.types import ChatMode
+                await self._client.chat.set_mode(ChatMode.CONCISE)
+                logger.debug("Set chat mode to CONCISE")
+            except (AttributeError, Exception) as e:
+                logger.debug(f"Could not set concise mode: {e}")
+
     async def _ensure_notebook(self):
+        """Ensure we have a notebook ID."""
         await self._ensure_client()
         if self._notebook_id is not None:
             return
@@ -89,6 +96,54 @@ class NLMModel(Model):
         self._notebook_id = nb.id
         logger.info(f"Auto-created notebook: {nb.id} ({nb.title})")
 
+    async def _chat_with_retry(self, question: str) -> str:
+        """Call chat.ask() with exponential backoff for rate limits."""
+        await self._ensure_notebook()
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                result = await self._client.chat.ask(
+                    self._notebook_id,
+                    question,
+                    conversation_id=None,  # Always stateless
+                )
+                return result.answer if hasattr(result, "answer") else str(result)
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_rate_limit = "rate limit" in error_msg or "429" in error_msg
+                is_auth_error = "csrf" in error_msg or "session" in error_msg or "401" in error_msg
+                is_network_error = "timeout" in error_msg or "connection" in error_msg
+
+                if is_auth_error and attempt == 0:
+                    # Try refreshing auth once
+                    logger.warning(f"Auth error, refreshing tokens: {e}")
+                    try:
+                        self._auth = await get_auth(force_refresh=True)
+                        self._client = NotebookLMClient(self._auth)
+                        await self._client.__aenter__()
+                        continue
+                    except Exception:
+                        pass
+
+                if is_rate_limit and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+                    logger.warning(f"Rate limited, retrying in {delay}s (attempt {attempt+1})")
+                    await asyncio.sleep(delay)
+                    continue
+
+                if is_network_error and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+                    logger.warning(f"Network error, retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Unrecoverable or exhausted retries
+                logger.error(f"chat.ask() failed after {attempt+1} attempts: {e}")
+                return f"Error: {e}"
+
+        return "Error: Max retries exceeded"
+
     def generate(
         self,
         messages: list[ChatMessage],
@@ -97,7 +152,12 @@ class NLMModel(Model):
         tools_to_call_from: list[Any] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        """Generate a response using NotebookLM chat API. Stateless per call."""
+        """Generate a response using NotebookLM chat API.
+
+        Smolagents passes its full message history. We flatten it into
+        a compact prompt string rather than passing conversation_id,
+        keeping NotebookLM stateless on its side.
+        """
         return self._run_async(self._agenerate(messages, stop_sequences, **kwargs))
 
     async def _agenerate(
@@ -106,20 +166,9 @@ class NLMModel(Model):
         stop_sequences: list[str] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        await self._ensure_notebook()
-
-        # Flatten smolagents history into single prompt (NO conversation_id)
         prompt = self._messages_to_prompt(messages)
 
-        if self._inject_coding_persona:
-            prompt = _CODING_PERSONA_PREFIX + prompt
-
-        try:
-            result = await self._client.chat.ask(self._notebook_id, prompt)
-            content = result.answer if hasattr(result, "answer") else str(result)
-        except Exception as e:
-            logger.warning(f"NotebookLM chat error: {e}")
-            content = f"NotebookLM Error: {e}"
+        content = await self._chat_with_retry(prompt)
 
         if stop_sequences:
             from smolagents.models import remove_content_after_stop_sequences
@@ -132,16 +181,25 @@ class NLMModel(Model):
         )
 
     def _messages_to_prompt(self, messages: list[ChatMessage]) -> str:
+        """Flatten smolagents message history into a single prompt string.
+
+        NotebookLM is stateless per call (no conversation_id).
+        smolagents manages its own state — we flatten the full ReAct
+        history into the question text.
+        """
         role_labels = {
             MessageRole.SYSTEM: "System",
             MessageRole.USER: "User",
             MessageRole.ASSISTANT: "Assistant",
-            MessageRole.TOOL_CALL: "Tool Call",
-            MessageRole.TOOL_RESPONSE: "Tool Result",
+            MessageRole.TOOL_CALL: "Action",
+            MessageRole.TOOL_RESPONSE: "Observation",
         }
         parts = []
         for msg in messages:
             label = role_labels.get(msg.role, str(msg.role))
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # Truncate very long observations to keep prompt compact
+            if msg.role == MessageRole.TOOL_RESPONSE and len(content) > 1500:
+                content = content[:1500] + "\n...[truncated]"
             parts.append(f"[{label}]: {content}")
         return "\n\n".join(parts)
