@@ -1,3 +1,4 @@
+import pytest
 """Tests for NotebookTemplate."""
 
 from smallclawlm.extensions.templates import NotebookTemplate

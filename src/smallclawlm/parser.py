@@ -98,7 +98,7 @@ def _parse_thought_action(text: str) -> ParsedAction | None:
         text, re.DOTALL | re.IGNORECASE
     )
     action_m = re.search(
-        r'ACTION\s*:\s*(\w+)\s*\((.+?)\)\s*$',
+        r'ACTION\s*:\s*(\w+)\s*\((.*?)\)',
         text, re.DOTALL | re.IGNORECASE
     )
 

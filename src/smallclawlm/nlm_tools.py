@@ -58,7 +58,7 @@ class DeepResearchTool(Tool, _ClientMixin):
     description = "Run deep web research on a topic. Returns a comprehensive report with cited sources."
     inputs = {
         "query": {"type": "string", "description": "Research question or topic"},
-        "mode": {"type": "string", "description": "Research depth: fast or deep (default: deep)"},
+        "mode": {"type": "string", "description": "Research depth: fast or deep (default: deep)", "nullable": True},
     }
     output_type = "string"
 
@@ -105,7 +105,7 @@ class GeneratePodcastTool(Tool, _ClientMixin):
     name = "generate_podcast"
     description = "Generate an audio overview podcast from the notebook sources."
     inputs = {
-        "instructions": {"type": "string", "description": "Custom instructions for the podcast (optional)", "nullable": True},
+        "instructions": {"type": "string", "description": "Custom instructions for the podcast", "nullable": True},
     }
     output_type = "string"
 
@@ -128,7 +128,7 @@ class GenerateVideoTool(Tool, _ClientMixin):
     name = "generate_video"
     description = "Generate a video explainer from the notebook sources."
     inputs = {
-        "style": {"type": "string", "description": "Video style: whiteboard or animated (default: whiteboard)"},
+        "style": {"type": "string", "description": "Video style: whiteboard or animated (default: whiteboard)", "nullable": True},
     }
     output_type = "string"
 
@@ -151,7 +151,7 @@ class GenerateQuizTool(Tool, _ClientMixin):
     name = "generate_quiz"
     description = "Generate a quiz from the notebook sources."
     inputs = {
-        "difficulty": {"type": "string", "description": "Quiz difficulty: easy, medium, or hard (default: medium)"},
+        "difficulty": {"type": "string", "description": "Quiz difficulty: easy, medium, or hard (default: medium)", "nullable": True},
     }
     output_type = "string"
 
@@ -217,7 +217,7 @@ class AddSourceTool(Tool, _ClientMixin):
     description = "Add a source (URL, YouTube, PDF) to the notebook. Waits for processing to complete."
     inputs = {
         "url": {"type": "string", "description": "URL of the source to add"},
-        "title": {"type": "string", "description": "Optional title for the source", "nullable": True},
+        "title": {"type": "string", "description": "Title for the source", "nullable": True},
     }
     output_type = "string"
 

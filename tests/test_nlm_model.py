@@ -15,7 +15,7 @@ class TestNLMModel:
         assert model.model_id == "notebooklm-gemini"
         assert model._notebook_id is None
         assert model._auto_create is True
-        assert model._language == "en"
+        # _language removed in v0.2.0
 
     def test_init_custom(self):
         """NLMModel accepts custom parameters."""
