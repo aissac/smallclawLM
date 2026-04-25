@@ -1,18 +1,16 @@
-"""NLMAgent — One agent, one notebook, one specialty.
+"""NLMAgent — Slow-path agent backed by NotebookLM chat API.
 
-Each agent owns exactly one NotebookLM notebook. The notebook's sources
-define its specialty. No cross-brain routing, no multi-brain orchestration.
+Used when the router classifies input as needing reasoning (conversational,
+analytical, multi-step). The fast path bypasses this entirely, going
+straight to Pipeline / direct tool calls.
 
-Usage:
-    # Research agent
-    agent = NLMAgent(notebook_id="abc123", tools="research")
-    result = agent.run("What are the latest fusion energy breakthroughs?")
+Architecture:
+  Fast path:  user input → router → Pipeline → direct API call → result
+  Slow path:  user input → router → NLMAgent → NLMModel.generate() → chat.ask()
+              → CodeAgent executes tools → result
 
-    # Custom instructions
-    agent = NLMAgent(
-        notebook_id="abc123",
-        instructions="You are a marine biology expert. Focus on ocean ecosystems.",
-    )
+One agent = one notebook. The notebook's sources define its specialty.
+No external LLM API keys needed — all reasoning runs through Gemini inside NotebookLM.
 """
 
 import logging
@@ -42,7 +40,9 @@ IMPORTANT RULES:
 1. Use tools to gather information before answering.
 2. When you have enough information, call final_answer() with your complete response.
 3. If a tool returns an error, read the suggested fix and try again.
-4. Always call final_answer() when done — it is the ONLY way to end execution."""
+4. Always call final_answer() when done — it is the ONLY way to end execution.
+5. Keep your code blocks simple — one tool call per block.
+"""
 
 
 class NLMAgent:
@@ -80,7 +80,6 @@ class NLMAgent:
             notebook_id=notebook_id,
             notebook_title=notebook_title or "SmallClawLM Agent",
             auto_create=True,
-            concise=True,
         )
 
         self.agent = CodeAgent(
@@ -93,52 +92,11 @@ class NLMAgent:
             planning_interval=planning_interval,
         )
 
-        self._model = model
-        self._share_notebook_id()
-
-    def _share_notebook_id(self):
-        """Propagate notebook_id to all tool instances."""
-        if self._notebook_id:
-            self._model._notebook_id = self._notebook_id
-        for tool in self.agent.tools:
-            if hasattr(tool, '_notebook_id'):
-                tool._notebook_id = self._notebook_id
-
-    def run(self, task: str, **kwargs) -> str:
-        """Run the agent on a task."""
-        self._model._run_async(self._model._ensure_notebook())
-        self._notebook_id = self._model._notebook_id
-        self._share_notebook_id()
-
-        if self._upload_sources:
-            self._upload_initial_sources()
-
-        logger.info(f"Starting NLMAgent with task: {task[:100]}...")
-        return self.agent.run(task, **kwargs)
-
-    async def _upload_initial_sources(self):
-        """Upload any initial source URLs to the notebook."""
-        if not self._upload_sources or not self._notebook_id:
-            return
-        client = await self._model._ensure_client()
-        for url in self._upload_sources:
-            try:
-                source = await client.sources.add_url(
-                    self._notebook_id, url, wait=True
-                )
-                logger.info(f"Uploaded source: {source.id}")
-            except Exception as e:
-                logger.warning(f"Failed to upload source {url}: {e}")
+    def run(self, task: str) -> str:
+        """Run a task and return the result."""
+        return self.agent.run(task)
 
 
-def create_agent(
-    specialty: str = "research",
-    notebook_id: str | None = None,
-    **kwargs,
-) -> NLMAgent:
-    """Factory function to create a specialized agent."""
-    return NLMAgent(
-        notebook_id=notebook_id,
-        tools=specialty,
-        **kwargs,
-    )
+def create_agent(specialty: str = "all", **kwargs) -> NLMAgent:
+    """Convenience factory for creating agents by specialty."""
+    return NLMAgent(tools=specialty, **kwargs)

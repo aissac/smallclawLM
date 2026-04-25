@@ -1,6 +1,17 @@
-"""SmallClawLM CLI - Command-line interface.
+"""SmallClawLM CLI — Hybrid Fast/Slow Path routing.
 
-One agent, one notebook, one specialty.
+Fast path: Direct Pipeline calls for known intents (podcast, report, etc.)
+Slow path: Full CodeAgent with NLMModel reasoning for complex tasks
+
+Commands:
+  smallclaw run "task"       # Auto-routes: fast path for tool intents, slow for reasoning
+  smallclaw agent            # Interactive slow-path session
+  smallclaw pipe              # Pipeline: chain operations declaratively
+  smallclaw research "topic" # Shortcut: deep research
+  smallclaw podcast          # Shortcut: generate podcast
+  smallclaw report           # Shortcut: generate report
+  smallclaw list              # List notebooks/sources
+  smallclaw login             # Authenticate with Google
 """
 
 import asyncio
@@ -8,12 +19,123 @@ import click
 import logging
 import sys
 
+from smallclawlm.router import route, Path as RoutePath
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _run_async(coro):
+    """Run an async coroutine from sync context, handling running event loops."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(lambda: asyncio.run(coro)).result()
+    else:
+        return asyncio.run(coro)
+
+
+# ─── Fast Path: Direct Pipeline Execution ───
+
+async def _fast_path(intent: str, params: dict, notebook_id: str | None):
+    """Execute a known intent directly via Pipeline — no LLM call."""
+    from smallclawlm.extensions.pipeline import Pipeline
+
+    pipe = Pipeline(notebook_id=notebook_id)
+
+    if intent == "deep_research":
+        query = params.get("query", "general research")
+        mode = params.get("mode", "deep")
+        pipe.research(query, mode=mode)
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "generate_podcast":
+        pipe.generate("podcast")
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "generate_video":
+        pipe.generate("video")
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "generate_quiz":
+        pipe.generate("quiz")
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "generate_mind_map":
+        pipe.generate("mindmap")
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "generate_report":
+        pipe.generate("report")
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "list_sources":
+        from smallclawlm.auth import get_auth
+        from notebooklm import NotebookLMClient
+        auth = await get_auth()
+        async with NotebookLMClient(auth) as client:
+            if not notebook_id:
+                notebooks = await client.notebooks.list()
+                if not notebooks:
+                    return "No notebooks found."
+                notebook_id = notebooks[0].id
+            sources = await client.sources.list(notebook_id)
+            if not sources:
+                return f"No sources in notebook {notebook_id}."
+            lines = [f"Sources in notebook {notebook_id}:"]
+            for s in sources:
+                name = getattr(s, 'title', None) or getattr(s, 'filename', str(s.id))
+                lines.append(f"  - {name} ({s.id})")
+            return "\n".join(lines)
+
+    elif intent == "add_source":
+        url = params.get("url", "")
+        if not url:
+            return "Error: no URL provided. Usage: smallclaw run 'add source <url>'"
+        pipe.add_source(url)
+        result = await pipe.execute_async()
+        return result
+
+    elif intent == "create_notebook":
+        from smallclawlm.auth import get_auth
+        from notebooklm import NotebookLMClient
+        auth = await get_auth()
+        async with NotebookLMClient(auth) as client:
+            title = params.get("title", "SmallClawLM Notebook")
+            nb = await client.notebooks.create(title)
+            return f"Created notebook '{title}' (id: {nb.id})"
+
+    else:
+        return f"Unknown intent: {intent}"
+
+
+async def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10):
+    """Execute a task using NLMAgent with NLMModel brain — for complex reasoning."""
+    from smallclawlm import NLMAgent
+
+    agent = NLMAgent(
+        notebook_id=notebook_id,
+        tools="all",
+        max_steps=max_steps,
+    )
+    return agent.run(task)
+
+
+# ─── CLI Commands ───
+
 @click.group()
-@click.version_option(version="0.2.0", prog_name="smallclaw")
+@click.version_option(version="0.3.0", prog_name="smallclaw")
 def cli():
     """SmallClawLM - Zero-token AI agent powered by Google NotebookLM."""
     pass
@@ -33,11 +155,12 @@ def login():
 
 
 @cli.command()
-def auth_check():
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+def auth_check(notebook_id):
     """Check if current authentication is valid."""
     from smallclawlm.auth import get_auth
     try:
-        asyncio.run(get_auth())
+        _run_async(get_auth())
         click.echo("Authentication is valid!")
     except RuntimeError as e:
         click.echo(f"{e}", err=True)
@@ -45,22 +168,69 @@ def auth_check():
 
 
 @cli.command()
+@click.argument("task")
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
-@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="all", help="Agent specialty type")
-@click.option("--max-steps", "-m", default=10, help="Maximum agent reasoning steps")
+@click.option("--max-steps", "-m", default=10, help="Max agent steps (slow path only)")
+@click.option("--force-slow", is_flag=True, help="Force slow path (agent) even for known intents")
+@click.option("--force-fast", is_flag=True, help="Force fast path (pipeline) even for conversational input")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def agent(notebook_id, specialty, max_steps, verbose):
-    """Start an interactive SmallClawLM agent session."""
+def run(task, notebook_id, max_steps, force_slow, force_fast, verbose):
+    """Run a task with automatic fast/slow path routing.
+
+    By default, the router determines whether to use fast path (direct tool call)
+    or slow path (agent reasoning). Use --force-slow or --force-fast to override.
+    """
+    if force_fast and force_slow:
+        click.echo("Error: cannot use both --force-fast and --force-slow", err=True)
+        sys.exit(1)
+
+    # Route the task
+    result = route(task)
+
+    if verbose:
+        click.echo(f"Route: {result.path.value} path → {result.intent} (confidence: {result.confidence:.0%})")
+
+    # Override if requested
+    if force_slow:
+        result = result.__class__(path=RoutePath.SLOW, intent="ask", confidence=0.5, params={"query": task})
+    elif force_fast:
+        if result.intent in ("deep_research", "generate_podcast", "generate_video",
+                              "generate_quiz", "generate_mind_map", "generate_report",
+                              "list_sources", "add_source", "create_notebook"):
+            result = result.__class__(path=RoutePath.FAST, intent=result.intent, confidence=1.0, params=result.params)
+        else:
+            click.echo("Error: no fast path available for this intent", err=True)
+            sys.exit(1)
+
+    # Execute
+    if result.path == RoutePath.FAST:
+        if verbose:
+            click.echo(f"Fast path: {result.intent}")
+        output = _run_async(_fast_path(result.intent, result.params, notebook_id))
+    else:
+        if verbose:
+            click.echo(f"Slow path: agent reasoning")
+        output = _slow_path(task, notebook_id, max_steps)
+
+    click.echo(output)
+
+
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+@click.option("--max-steps", "-m", default=10, help="Max agent steps")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+def agent(notebook_id, max_steps, verbose):
+    """Start an interactive agent session (always slow path)."""
     from smallclawlm import NLMAgent
 
     nlm_agent = NLMAgent(
         notebook_id=notebook_id,
-        tools=specialty,
+        tools="all",
         max_steps=max_steps,
         verbosity_level=2 if verbose else 1,
     )
 
-    click.echo(f"SmallClawLM Agent (specialty: {specialty})")
+    click.echo("SmallClawLM Agent (slow path - full reasoning)")
     click.echo("Type your tasks, Ctrl+C to exit")
     click.echo("=" * 50)
 
@@ -77,110 +247,89 @@ def agent(notebook_id, specialty, max_steps, verbose):
 
 
 @cli.command()
-@click.argument("task")
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
-@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="all", help="Agent specialty type")
-@click.option("--max-steps", "-m", default=10, help="Maximum agent steps")
-def run(task, notebook_id, specialty, max_steps):
-    """Run a single task and exit."""
-    from smallclawlm import NLMAgent
+@click.option("--add-source", "-s", multiple=True, help="Add URL as source (can repeat)")
+@click.option("--generate", "-g", type=click.Choice(["podcast", "video", "quiz", "mindmap", "report"]),
+              help="Generate an artifact")
+@click.option("--ask", "-a", "question", help="Ask a question about sources")
+@click.option("--research", "-r", help="Run deep research on a topic")
+def pipe(notebook_id, add_source, generate, question, research):
+    """Pipeline: chain operations without an agent (fast path)."""
+    from smallclawlm.extensions.pipeline import Pipeline, ArtifactType
 
-    nlm_agent = NLMAgent(
-        notebook_id=notebook_id,
-        tools=specialty,
-        max_steps=max_steps,
-    )
-    result = nlm_agent.run(task)
+    pipe = Pipeline(notebook_id=notebook_id)
+
+    for url in add_source:
+        pipe.add_source(url)
+
+    if research:
+        pipe.research(research)
+
+    if question:
+        pipe.ask(question)
+
+    if generate:
+        pipe.generate(ArtifactType(generate))
+
+    if not add_source and not question and not research and not generate:
+        click.echo("No operations specified. Use --add-source, --ask, --research, or --generate.")
+        return
+
+    result = pipe.execute()
     click.echo(result)
 
 
-@cli.command()
-@click.option("--research", "-r", help="Research query")
-@click.option("--generate", "-g", type=click.Choice(["podcast", "video", "quiz", "mindmap", "report"]), help="Artifact to generate")
-@click.option("--add-source", "-s", multiple=True, help="Add source URL (repeatable)")
-@click.option("--notebook-id", "-n", default=None, help="Notebook ID")
-def pipe(research, generate, add_source, notebook_id):
-    """Run a pipeline: research -> generate."""
-    click.echo("Running pipeline...")
-
-    async def _run():
-        from smallclawlm.auth import get_auth
-        from notebooklm import NotebookLMClient
-
-        auth = await get_auth()
-        async with NotebookLMClient(auth) as client:
-            if notebook_id:
-                nb_id = notebook_id
-            else:
-                nb = await client.notebooks.create("Pipeline Session")
-                nb_id = nb.id
-                click.echo(f"Created notebook: {nb_id}")
-
-            for url in add_source:
-                src = await client.sources.add_url(nb_id, url, wait=True)
-                click.echo(f"Added source: {src.id}")
-
-            if research:
-                click.echo(f"Researching: {research}")
-                await client.research.start(notebook_id=nb_id, query=research, source="web", mode="deep")
-                poll = await client.research.poll(nb_id)
-                click.echo("Research complete")
-
-            if generate:
-                click.echo(f"Generating {generate}...")
-                gen_map = {
-                    "podcast": client.artifacts.generate_audio,
-                    "video": client.artifacts.generate_video,
-                    "quiz": client.artifacts.generate_quiz,
-                    "mindmap": client.artifacts.generate_mind_map,
-                    "report": client.artifacts.generate_report,
-                }
-                result = await gen_map[generate](nb_id)
-                click.echo(f"Generation started: {getattr(result, 'task_id', 'done')}")
-
-            click.echo("Pipeline complete!")
-
-    try:
-        asyncio.run(_run())
-    except Exception as e:
-        click.echo(f"Pipeline failed: {e}", err=True)
-        sys.exit(1)
-
+# ─── Shortcut Commands ───
 
 @cli.command()
 @click.argument("query")
-@click.option("--mode", "-m", type=click.Choice(["fast", "deep"]), default="deep", help="Research mode")
-@click.option("--notebook-id", "-n", default=None, help="Notebook ID")
-def research(query, mode, notebook_id):
-    """Run a research query on NotebookLM."""
-    async def _run():
-        from smallclawlm.auth import get_auth
-        from notebooklm import NotebookLMClient
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+@click.option("--mode", type=click.Choice(["fast", "deep"]), default="deep", help="Research depth")
+def research(query, notebook_id, mode):
+    """Run deep research on a topic (fast path shortcut)."""
+    output = _run_async(_fast_path("deep_research", {"query": query, "mode": mode}, notebook_id))
+    click.echo(output)
 
-        auth = await get_auth()
-        async with NotebookLMClient(auth) as client:
-            nb_id = notebook_id
-            if not nb_id:
-                notebooks = await client.notebooks.list()
-                if notebooks:
-                    nb_id = notebooks[0].id
-                else:
-                    nb = await client.notebooks.create("Research")
-                    nb_id = nb.id
 
-            click.echo(f"Running {mode} research: {query}")
-            await client.research.start(notebook_id=nb_id, query=query, source="web", mode=mode)
-            poll = await client.research.poll(nb_id)
-            if poll.get("report"):
-                click.echo(poll["report"])
-            else:
-                click.echo("Research complete.")
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+@click.option("--instructions", "-i", default=None, help="Custom instructions for the podcast")
+def podcast(notebook_id, instructions):
+    """Generate a podcast from notebook sources (fast path shortcut)."""
+    output = _run_async(_fast_path("generate_podcast", {"instructions": instructions}, notebook_id))
+    click.echo(output)
 
-    try:
-        asyncio.run(_run())
-    except Exception as e:
-        click.echo(f"Research failed: {e}", err=True)
-        sys.exit(1)
+
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+def report(notebook_id):
+    """Generate a report from notebook sources (fast path shortcut)."""
+    output = _run_async(_fast_path("generate_report", {}, notebook_id))
+    click.echo(output)
+
+
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+def quiz(notebook_id):
+    """Generate a quiz from notebook sources (fast path shortcut)."""
+    output = _run_async(_fast_path("generate_quiz", {}, notebook_id))
+    click.echo(output)
+
+
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+def mindmap(notebook_id):
+    """Generate a mind map from notebook sources (fast path shortcut)."""
+    output = _run_async(_fast_path("generate_mind_map", {}, notebook_id))
+    click.echo(output)
+
+
+@cli.command()
+@click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
+def list_sources(notebook_id):
+    """List sources in a notebook."""
+    output = _run_async(_fast_path("list_sources", {}, notebook_id))
+    click.echo(output)
 
 
 if __name__ == "__main__":

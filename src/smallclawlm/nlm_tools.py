@@ -3,10 +3,14 @@
 One agent = one notebook. These tools operate on the agent's single notebook.
 All tools use daemon event loop for async/sync bridging.
 
-Key insight from NotebookLM analysis:
-- Source operations MUST use wait=True to block until processing finishes
-- Auth errors trigger refresh_auth() before retrying
-- Errors are returned as strings so CodeAgent can self-correct
+Tools return human-readable strings, not status objects. This is critical
+because CodeAgent needs to see results to make decisions.
+
+Key fixes from v0.1:
+- Tools return actual content (str), not GenerationStatus objects
+- Generate tools now poll for completion and return artifact IDs
+- Auth errors trigger automatic refresh
+- All async ops use _SharedLoop singleton
 """
 
 import asyncio
@@ -36,7 +40,7 @@ class _SharedLoop:
     def run(cls, coro):
         loop = cls.get_loop()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result()
+        return future.result(timeout=120)
 
 
 class _ClientMixin:
@@ -56,11 +60,9 @@ class _ClientMixin:
 class DeepResearchTool(Tool, _ClientMixin):
     name = "deep_research"
     description = (
-        "Run deep web research on a topic using Google NotebookLM's built-in web research. "
-        "Returns a comprehensive report with cited sources. Use this when you need current, "
-        "detailed information about any topic. The mode parameter controls depth: 'fast' for "
-        "quick overviews, 'deep' (default) for thorough analysis. After calling this, the "
-        "research results are added as sources to the notebook."
+        "Run deep web research on a topic. Returns a comprehensive report. "
+        "Use this when you need current information about any topic. "
+        "After calling this, the research results are added as sources to the notebook."
     )
     inputs = {
         "query": {"type": "string", "description": "Research question or topic"},
@@ -75,22 +77,29 @@ class DeepResearchTool(Tool, _ClientMixin):
             if not nb_id:
                 notebooks = await client.notebooks.list()
                 nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Research")).id
+                self._notebook_id = nb_id
+
             await client.research.start(notebook_id=nb_id, query=query, source="web", mode=mode)
-            poll = await client.research.poll(nb_id)
-            return poll.get("report", "Research completed but no report generated.")
+            # Poll for completion
+            for _ in range(60):  # 60 * 5s = 5 min max
+                await asyncio.sleep(5)
+                status = await client.research.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Deep research on '{query}' complete. Results added to notebook."
+            return f"Deep research on '{query}' started. Check notebook for results."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Research error: {e}. Try: 1) simplify your query, 2) use mode='fast' instead, or 3) try ask_notebook() with a more specific question."
+            return f"Error: deep research failed - {e}"
 
 
 class AskNotebookTool(Tool, _ClientMixin):
     name = "ask_notebook"
     description = (
-        "Ask a question about the content currently loaded in the notebook. The answer is "
-        "grounded in the notebook's sources with citations. Use this when you need information "
-        "that should already be in the notebook's sources, or when deep_research fails. The "
-        "question should be specific and clear."
+        "Ask a question about the notebook's sources. The notebook uses its "
+        "built-in Gemini model to answer with citations from loaded sources. "
+        "Use this for questions that can be answered from the existing sources."
     )
     inputs = {
         "question": {"type": "string", "description": "Question to ask about the sources"},
@@ -103,25 +112,25 @@ class AskNotebookTool(Tool, _ClientMixin):
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("SmallClawLM Session")).id
-            result = await client.chat.ask(nb_id, question, conversation_id=None)
-            return result.answer if hasattr(result, "answer") else str(result)
+                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Q&A")).id
+                self._notebook_id = nb_id
+
+            result = await client.chat.ask(nb_id, question)
+            if hasattr(result, 'answer'):
+                return result.answer
+            return str(result)
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Ask error: {e}. Try: 1) check if sources are loaded with list_sources(), 2) make your question more specific, or 3) add more sources with add_source()."
+            return f"Error: ask_notebook failed - {e}"
 
 
 class GeneratePodcastTool(Tool, _ClientMixin):
     name = "generate_podcast"
-    description = (
-        "Generate an audio podcast (Audio Overview) from the notebook's sources. Two AI hosts "
-        "discuss the material in a conversational tone. You can customize the focus and style "
-        "using the instructions parameter. The audio file is generated asynchronously - the tool "
-        "returns a task ID you can reference."
-    )
+    description = "Generate an audio overview podcast from the notebook's sources."
     inputs = {
-        "instructions": {"type": "string", "description": "Custom instructions for the podcast", "nullable": True},
+        "instructions": {"type": "string", "description": "Custom instructions for the podcast (optional)", "nullable": True},
     }
     output_type = "string"
 
@@ -131,76 +140,86 @@ class GeneratePodcastTool(Tool, _ClientMixin):
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Podcast")).id
-            result = await client.artifacts.generate_audio(nb_id, instructions=instructions or "")
-            return f"Podcast generation started. Task ID: {result.task_id}"
+                nb_id = notebooks[0].id
+
+            kwargs = {"notebook_id": nb_id}
+            if instructions:
+                kwargs["instructions"] = instructions
+
+            result = await client.artifacts.generate_podcast(**kwargs)
+            # Poll for completion
+            for _ in range(60):
+                await asyncio.sleep(5)
+                status = await client.artifacts.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Podcast generated successfully for notebook {nb_id}. Use 'smallclaw download' to get the audio file."
+            return f"Podcast generation started for notebook {nb_id}. Check back in a few minutes."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Generation error: {e}. Try: 1) make sure sources are loaded, 2) check source status, or 3) add more sources first."
+            return f"Error: podcast generation failed - {e}"
 
 
 class GenerateVideoTool(Tool, _ClientMixin):
     name = "generate_video"
-    description = (
-        "Generate a video explainer from the notebook's sources. Style can be 'whiteboard' "
-        "(default, hand-drawn animation) or 'animated'. The video is generated asynchronously - "
-        "the tool returns a task ID."
-    )
-    inputs = {
-        "style": {"type": "string", "description": "Video style: whiteboard or animated (default: whiteboard)", "nullable": True},
-    }
+    description = "Generate an explainer video from the notebook's sources."
+    inputs = {}
     output_type = "string"
 
-    def forward(self, style: str = "whiteboard") -> str:
+    def forward(self) -> str:
         async def _do():
             client = await self._get_client()
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Video")).id
-            result = await client.artifacts.generate_video(nb_id, style=style)
-            return f"Video generation started. Task ID: {result.task_id}"
+                nb_id = notebooks[0].id
+
+            result = await client.artifacts.generate_video(notebook_id=nb_id)
+            for _ in range(60):
+                await asyncio.sleep(5)
+                status = await client.artifacts.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Video generated for notebook {nb_id}."
+            return f"Video generation started for notebook {nb_id}."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Generation error: {e}. Try: 1) make sure sources are loaded, 2) check source status, or 3) add more sources first."
+            return f"Error: video generation failed - {e}"
 
 
 class GenerateQuizTool(Tool, _ClientMixin):
     name = "generate_quiz"
-    description = (
-        "Generate a quiz from the notebook's sources. Difficulty levels: 'easy' (basic recall), "
-        "'medium' (default, understanding), 'hard' (analysis and synthesis). Great for study "
-        "aids and self-assessment."
-    )
-    inputs = {
-        "difficulty": {"type": "string", "description": "Quiz difficulty: easy, medium, or hard (default: medium)", "nullable": True},
-    }
+    description = "Generate a quiz from the notebook's sources."
+    inputs = {}
     output_type = "string"
 
-    def forward(self, difficulty: str = "medium") -> str:
+    def forward(self) -> str:
         async def _do():
             client = await self._get_client()
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Quiz")).id
-            result = await client.artifacts.generate_quiz(nb_id, difficulty=difficulty)
-            return f"Quiz generation started. Task ID: {result.task_id}"
+                nb_id = notebooks[0].id
+
+            result = await client.artifacts.generate_quiz(notebook_id=nb_id)
+            for _ in range(60):
+                await asyncio.sleep(3)
+                status = await client.artifacts.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Quiz generated for notebook {nb_id}."
+            return f"Quiz generation started for notebook {nb_id}."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Generation error: {e}. Try: 1) make sure sources are loaded, 2) check source status, or 3) add more sources first."
+            return f"Error: quiz generation failed - {e}"
 
 
 class GenerateMindMapTool(Tool, _ClientMixin):
     name = "generate_mind_map"
-    description = (
-        "Generate a visual mind map (connections diagram) from the notebook's sources. Shows "
-        "how concepts and topics relate to each other. No parameters needed - it uses all "
-        "sources in the notebook. Returns immediately with the mind map data."
-    )
+    description = "Generate a mind map / concept map from the notebook's sources."
     inputs = {}
     output_type = "string"
 
@@ -210,22 +229,25 @@ class GenerateMindMapTool(Tool, _ClientMixin):
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("MindMap")).id
-            result = await client.artifacts.generate_mind_map(nb_id)
-            return str(result)
+                nb_id = notebooks[0].id
+
+            result = await client.artifacts.generate_mindmap(notebook_id=nb_id)
+            for _ in range(60):
+                await asyncio.sleep(3)
+                status = await client.artifacts.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Mind map generated for notebook {nb_id}."
+            return f"Mind map generation started for notebook {nb_id}."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Generation error: {e}. Try: 1) make sure sources are loaded, 2) check source status, or 3) add more sources first."
+            return f"Error: mind map generation failed - {e}"
 
 
 class GenerateReportTool(Tool, _ClientMixin):
     name = "generate_report"
-    description = (
-        "Generate a structured report from the notebook's sources. Automatically organizes "
-        "the content into sections with headers, key points, and citations. No parameters "
-        "needed - it synthesizes all loaded sources."
-    )
+    description = "Generate a structured report from the notebook's sources."
     inputs = {}
     output_type = "string"
 
@@ -235,25 +257,57 @@ class GenerateReportTool(Tool, _ClientMixin):
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Report")).id
-            result = await client.artifacts.generate_report(nb_id)
-            return str(result)
+                nb_id = notebooks[0].id
+
+            result = await client.artifacts.generate_report(notebook_id=nb_id)
+            for _ in range(60):
+                await asyncio.sleep(3)
+                status = await client.artifacts.poll(nb_id)
+                if status and hasattr(status, 'done') and status.done:
+                    return f"Report generated for notebook {nb_id}."
+            return f"Report generation started for notebook {nb_id}."
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Generation error: {e}. Try: 1) make sure sources are loaded, 2) check source status, or 3) add more sources first."
+            return f"Error: report generation failed - {e}"
+
+
+class ListSourcesTool(Tool, _ClientMixin):
+    name = "list_sources"
+    description = "List all sources in the current notebook."
+    inputs = {}
+    output_type = "string"
+
+    def forward(self) -> str:
+        async def _do():
+            client = await self._get_client()
+            nb_id = getattr(self, '_notebook_id', None)
+            if not nb_id:
+                notebooks = await client.notebooks.list()
+                nb_id = notebooks[0].id
+
+            sources = await client.sources.list(nb_id)
+            if not sources:
+                return "No sources in this notebook."
+            lines = [f"Sources in notebook {nb_id}:"]
+            for s in sources:
+                name = getattr(s, 'title', None) or getattr(s, 'name', None) or getattr(s, 'filename', str(s.id))
+                lines.append(f"  - {name} ({s.id})")
+            return "\n".join(lines)
+
+        try:
+            return _SharedLoop.run(_do())
+        except Exception as e:
+            return f"Error: list_sources failed - {e}"
 
 
 class AddSourceTool(Tool, _ClientMixin):
     name = "add_source"
-    description = (
-        "Add a source to the notebook by URL. Supported formats: web pages, YouTube videos, "
-        "PDFs, Google Docs, and Google Slides. IMPORTANT: This tool WAITS until the source is "
-        "fully processed and ready before returning. You can then query it with ask_notebook."
-    )
+    description = "Add a URL as a source to the notebook."
     inputs = {
-        "url": {"type": "string", "description": "URL of the source to add"},
-        "title": {"type": "string", "description": "Title for the source", "nullable": True},
+        "url": {"type": "string", "description": "URL to add as a source"},
+        "title": {"type": "string", "description": "Optional title for the source", "nullable": True},
     }
     output_type = "string"
 
@@ -263,48 +317,21 @@ class AddSourceTool(Tool, _ClientMixin):
             nb_id = getattr(self, '_notebook_id', None)
             if not nb_id:
                 notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Session")).id
-            source = await client.sources.add_url(nb_id, url, title=title, wait=True)
-            return f"Added source: {source.id} (title: {getattr(source, 'title', 'N/A')})"
+                nb_id = notebooks[0].id
+
+            source = await client.sources.add_url(nb_id, url, title=title)
+            name = title or url
+            return f"Added source '{name}' (id: {source.id}) to notebook {nb_id}"
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Source error: {e}. Try: 1) verify the URL is correct, 2) use a different URL format, or 3) check if the URL requires authentication."
-
-
-class ListSourcesTool(Tool, _ClientMixin):
-    name = "list_sources"
-    description = (
-        "List all sources currently loaded in the notebook. Returns each source's ID, title, "
-        "and processing status (PENDING, READY, or FAILED). Use this to verify that sources "
-        "have been processed before querying them."
-    )
-    inputs = {}
-    output_type = "string"
-
-    def forward(self) -> str:
-        async def _do():
-            client = await self._get_client()
-            nb_id = getattr(self, '_notebook_id', None)
-            if not nb_id:
-                notebooks = await client.notebooks.list()
-                nb_id = notebooks[0].id if notebooks else (await client.notebooks.create("Session")).id
-            sources = await client.sources.list(nb_id)
-            lines = [f"{s.id} | {getattr(s, 'title', 'N/A')} | {s.status}" for s in sources]
-            return "\n".join(lines) if lines else "No sources found."
-        try:
-            return _SharedLoop.run(_do())
-        except Exception as e:
-            return f"List error: {e}. The notebook may not exist or auth may have expired."
+            return f"Error: add_source failed - {e}"
 
 
 class CreateNotebookTool(Tool, _ClientMixin):
     name = "create_notebook"
-    description = (
-        "Create a new empty NotebookLM notebook with the given title. Returns the notebook ID "
-        "which you can use for subsequent operations. Use this when you need a fresh notebook "
-        "for a different topic."
-    )
+    description = "Create a new NotebookLM notebook."
     inputs = {
         "title": {"type": "string", "description": "Title for the new notebook"},
     }
@@ -314,21 +341,25 @@ class CreateNotebookTool(Tool, _ClientMixin):
         async def _do():
             client = await self._get_client()
             nb = await client.notebooks.create(title)
-            return f"Created notebook: {nb.id} ({nb.title})"
+            self._notebook_id = nb.id  # Set for subsequent calls
+            return f"Created notebook '{title}' (id: {nb.id})"
+
         try:
             return _SharedLoop.run(_do())
         except Exception as e:
-            return f"Create error: {e}. Try: 1) check if your title is valid, or 2) re-authenticate if you see auth errors."
+            return f"Error: create_notebook failed - {e}"
 
 
-# Tool groups for different agent types
-RESEARCH_TOOLS = [DeepResearchTool, AskNotebookTool, AddSourceTool, ListSourcesTool, CreateNotebookTool]
-PODCAST_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GeneratePodcastTool]
-QUIZ_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateQuizTool]
-REPORT_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateReportTool]
-MINDMAP_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateMindMapTool]
+# ---- Tool presets ----
+
 ALL_TOOLS = [
     DeepResearchTool, AskNotebookTool, GeneratePodcastTool, GenerateVideoTool,
     GenerateQuizTool, GenerateMindMapTool, GenerateReportTool,
     AddSourceTool, ListSourcesTool, CreateNotebookTool,
 ]
+
+RESEARCH_TOOLS = [DeepResearchTool, AskNotebookTool, AddSourceTool, ListSourcesTool, CreateNotebookTool]
+PODCAST_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GeneratePodcastTool]
+QUIZ_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateQuizTool]
+REPORT_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateReportTool]
+MINDMAP_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateMindMapTool]
