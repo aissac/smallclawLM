@@ -54,13 +54,9 @@ class TelegramGateway:
         self,
         token: str,
         max_steps: int = 10,
-        n_ctx: int = 2048,
-        n_threads: int = 4,
     ):
         self.token = token
         self.max_steps = max_steps
-        self.n_ctx = n_ctx
-        self.n_threads = n_threads
 
         # Per-chat state: chat_id -> {"notebook_id": str, "agent": NLMAgent}
         self._chat_state: dict[int, dict] = {}
@@ -219,8 +215,6 @@ class TelegramGateway:
                     notebook_id=notebook_id,
                     tools="all",
                     max_steps=self.max_steps,
-                    n_ctx=self.n_ctx,
-                    n_threads=self.n_threads,
                 )
                 state["agent"] = agent
                 self._chat_state[chat_id] = state

@@ -1,18 +1,17 @@
 """NLMAgent — Agent where NotebookLM IS the brain.
 
-Uses OrchestratorModel (3-layer: reflex/cognition/memory) as the model
-and NLMTools as the hands. Every generate() call automatically:
-  1. Injects memory context from the notebook
-  2. Falls back to NotebookLM chat for unknowns
-  3. Auto-syncs results back to the notebook
+Uses NLMModel (NotebookLM's built-in Gemini) as the smolagents Model.
+Every generate() call goes through NotebookLM chat, which produces
+proper <code> tool_call blocks that CodeAgent can execute.
 
-The agent doesn't "decide" to use NotebookLM — it IS NotebookLM.
+The agent doesn't "call" NotebookLM — it lives in NotebookLM.
+Every thought, decision, and research result flows through the notebook.
 """
 
 import logging
 from smolagents import CodeAgent
 
-from smallclawlm.orchestrator import OrchestratorModel
+from smallclawlm.nlm_model import NLMModel
 from smallclawlm.nlm_memory import NLMMemory
 from smallclawlm.nlm_tools import (
     ALL_TOOLS, RESEARCH_TOOLS, PODCAST_TOOLS, QUIZ_TOOLS,
@@ -51,9 +50,9 @@ def create_agent(
     notebook_id: str | None = None,
     notebook_title: str = "SmallClawLM Agent",
     tools: str | list[type] = "all",
-    model_path: str | None = None,
-    n_threads: int = 4,
-    n_ctx: int = 2048,
+    instructions: str | None = None,
+    planning_interval: int | None = None,
+    max_steps: int = 10,
     **kwargs,
 ) -> "NLMAgent":
     """Factory function to create an agent with sensible defaults."""
@@ -61,9 +60,9 @@ def create_agent(
         notebook_id=notebook_id,
         notebook_title=notebook_title,
         tools=tools,
-        model_path=model_path,
-        n_threads=n_threads,
-        n_ctx=n_ctx,
+        instructions=instructions,
+        planning_interval=planning_interval,
+        max_steps=max_steps,
         **kwargs,
     )
     return agent
@@ -72,17 +71,15 @@ def create_agent(
 class NLMAgent:
     """One agent, one notebook, one brain.
 
-    The OrchestratorModel handles the 3-layer architecture automatically.
-    The agent just calls tools and returns answers — memory and cognition
-    are built into every generate() call.
+    NLMModel (NotebookLM's Gemini) handles all reasoning and tool calling.
+    No local model needed — Gemini produces correct <code> blocks natively.
 
     Args:
         notebook_id: NotebookLM notebook ID. Auto-creates one if None.
         notebook_title: Title for auto-created notebook.
         tools: Tool preset name ("all", "research", etc.) or list of tool classes.
-        model_path: Path to GGUF model file (smollm backend only).
-        n_threads: Number of threads for SmolLM3 (optimal: 4 for dual-channel DDR4).
-        n_ctx: Context window size for SmolLM3.
+        max_steps: Max steps for the CodeAgent loop.
+        planning_interval: How often to re-plan (None = every step).
     """
 
     def __init__(
@@ -93,11 +90,8 @@ class NLMAgent:
         instructions: str | None = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
-        model_path: str | None = None,
-        n_threads: int = 4,
-        n_ctx: int = 2048,
-        n_gpu_layers: int = 0,
         max_steps: int = 10,
+        **kwargs,
     ):
         self._notebook_id = notebook_id
         self._notebook_title = notebook_title or "SmallClawLM Agent"
@@ -116,19 +110,17 @@ class NLMAgent:
             for tool in self._tool_instances:
                 tool._notebook_id = notebook_id
 
-        # Create OrchestratorModel (3-layer brain)
+        # Create NLMModel (NotebookLM's Gemini — the ONLY brain)
         self._memory = NLMMemory(
             notebook_id=notebook_id,
             notebook_title=self._notebook_title,
         )
-        self._model = OrchestratorModel(
-            memory=self._memory,
+        self._model = NLMModel(
             notebook_id=notebook_id,
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
+            notebook_title=self._notebook_title,
         )
+
+        self._max_steps = max_steps
 
         # Build the CodeAgent
         self._agent = CodeAgent(
@@ -138,7 +130,6 @@ class NLMAgent:
             additional_authorized_imports=additional_authorized_imports or [],
             planning_interval=planning_interval,
         )
-        self._max_steps = max_steps
 
     @property
     def memory(self) -> NLMMemory:
@@ -146,8 +137,8 @@ class NLMAgent:
         return self._memory
 
     @property
-    def model(self) -> OrchestratorModel:
-        """Access the orchestrator model."""
+    def model(self) -> NLMModel:
+        """Access the NLM model."""
         return self._model
 
     @property
@@ -159,17 +150,19 @@ class NLMAgent:
         """Run a task through the agent.
 
         Every call automatically:
-        1. Injects memory context
-        2. Uses SmolLM3 for tool selection (reflex)
-        3. Escalates to NotebookLM for unknowns (cognition)
-        4. Auto-syncs results to memory
+        1. Routes through NotebookLM's Gemini for reasoning
+        2. Executes tool calls via CodeAgent
+        3. Auto-syncs results to memory
         """
         try:
             result = self._agent.run(task, max_steps=self._max_steps, **kwargs)
             # Auto-sync the result to memory
             if result:
-                self._memory.add_observation("agent_result", str(result)[:500])
+                self._memory.add_observation("agent_response", str(result)[:500])
             return result
         except Exception as e:
             self._memory.add(f"Agent error: {e}")
             raise
+
+    def __repr__(self):
+        return f"NLMAgent(nb={self._notebook_id or 'auto'}, tools={len(self._tool_instances)})"
