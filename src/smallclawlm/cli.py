@@ -46,7 +46,7 @@ def auth_check():
 
 @cli.command()
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
-@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="research", help="Agent specialty type")
+@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="all", help="Agent specialty type")
 @click.option("--max-steps", "-m", default=10, help="Maximum agent reasoning steps")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def agent(notebook_id, specialty, max_steps, verbose):
@@ -79,7 +79,7 @@ def agent(notebook_id, specialty, max_steps, verbose):
 @cli.command()
 @click.argument("task")
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
-@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="research", help="Agent specialty type")
+@click.option("--specialty", "-s", type=click.Choice(["research", "podcast", "quiz", "report", "mindmap", "all"]), default="all", help="Agent specialty type")
 @click.option("--max-steps", "-m", default=10, help="Maximum agent steps")
 def run(task, notebook_id, specialty, max_steps):
     """Run a single task and exit."""
