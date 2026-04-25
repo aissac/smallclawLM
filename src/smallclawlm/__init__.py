@@ -9,7 +9,7 @@ The agent doesn't "call" NotebookLM — it lives in NotebookLM.
 Every thought, decision, and research result flows through the notebook automatically.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from smallclawlm.orchestrator import OrchestratorModel
 from smallclawlm.nlm_memory import NLMMemory

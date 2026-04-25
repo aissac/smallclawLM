@@ -354,6 +354,8 @@ def pipe(notebook_id, add_source, generate, question, research):
 @click.option("--mode", type=click.Choice(["fast", "deep"]), default="deep", help="Research depth")
 def research(query, notebook_id, mode):
     """Run deep research on a topic (fast path shortcut)."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, query)
     output = _run_async(_fast_path("deep_research", {"query": query, "mode": mode}, notebook_id))
     click.echo(output)
 
@@ -363,6 +365,8 @@ def research(query, notebook_id, mode):
 @click.option("--instructions", "-i", default=None, help="Custom instructions for the podcast")
 def podcast(notebook_id, instructions):
     """Generate a podcast from notebook sources (fast path shortcut)."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "podcast generation")
     output = _run_async(_fast_path("generate_podcast", {"instructions": instructions}, notebook_id))
     click.echo(output)
 
@@ -371,6 +375,8 @@ def podcast(notebook_id, instructions):
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 def report(notebook_id):
     """Generate a report from notebook sources (fast path shortcut)."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "report generation")
     output = _run_async(_fast_path("generate_report", {}, notebook_id))
     click.echo(output)
 
@@ -379,6 +385,8 @@ def report(notebook_id):
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 def quiz(notebook_id):
     """Generate a quiz from notebook sources (fast path shortcut)."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "quiz generation")
     output = _run_async(_fast_path("generate_quiz", {}, notebook_id))
     click.echo(output)
 
@@ -387,6 +395,8 @@ def quiz(notebook_id):
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 def mindmap(notebook_id):
     """Generate a mind map from notebook sources (fast path shortcut)."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "mind map generation")
     output = _run_async(_fast_path("generate_mind_map", {}, notebook_id))
     click.echo(output)
 
@@ -395,6 +405,8 @@ def mindmap(notebook_id):
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 def list_sources(notebook_id):
     """List sources in a notebook."""
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "list sources")
     output = _run_async(_fast_path("list_sources", {}, notebook_id))
     click.echo(output)
 

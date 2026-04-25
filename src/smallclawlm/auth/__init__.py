@@ -2,10 +2,16 @@
 
 Handles Google OAuth for NotebookLM access via notebooklm-py.
 Caches auth tokens in memory to avoid disk reads on every API call.
+
+Two auth sources (in priority order):
+  1. SmallClawLM's own auth file (~/.smallclawlm/auth.json)
+  2. notebooklm-py's Playwright storage_state.json (fallback)
+
+AuthTokens is async — from_storage() is a coroutine. All public functions
+handle the sync/async bridge automatically.
 """
 
 import asyncio
-import json
 import logging
 import threading
 from pathlib import Path
@@ -22,8 +28,8 @@ _CACHE_LOCK = threading.Lock()
 async def get_auth(force_refresh: bool = False):
     """Get authenticated tokens for NotebookLM.
 
-    Tries SmallClawLM's own auth first, then falls back to notebooklm-py's
-    stored credentials (Playwright storage_state.json). Results are cached.
+    Uses notebooklm-py's AuthTokens.from_storage() which reads the
+    Playwright storage_state.json. Results are cached in memory.
 
     Args:
         force_refresh: If True, invalidate cache and re-read from disk.
@@ -44,41 +50,48 @@ async def get_auth(force_refresh: bool = False):
         if _AUTH_CACHE is not None and not force_refresh:
             return _AUTH_CACHE
 
-        # Try SmallClawLM's own auth first
+        # Primary: SmallClawLM's own auth file
         if DEFAULT_STORAGE.exists():
             try:
-                tokens = await _load_auth(DEFAULT_STORAGE)
+                from notebooklm.auth import AuthTokens
+                tokens = await AuthTokens.from_storage(DEFAULT_STORAGE)
                 _AUTH_CACHE = tokens
+                logger.info("Loaded auth from SmallClawLM storage")
                 return tokens
             except Exception as e:
                 logger.warning(f"Failed to load SmallClawLM auth: {e}")
 
-        # Fall back to notebooklm-py's stored auth (Playwright storage_state.json)
+        # Fallback: notebooklm-py's default storage
         try:
-            from notebooklm.auth import AuthTokens, extract_cookies_from_storage, fetch_tokens
-            from notebooklm.paths import get_storage_path
-
-            storage = get_storage_path()
-            storage_state = json.loads(storage.read_text())
-            cookies = extract_cookies_from_storage(storage_state)
-            csrf, session_id = await fetch_tokens(cookies)
-            tokens = AuthTokens(cookies=cookies, csrf_token=csrf, session_id=session_id)
+            from notebooklm.auth import AuthTokens
+            tokens = await AuthTokens.from_storage()  # Uses default path
             _AUTH_CACHE = tokens
+            logger.info("Loaded auth from notebooklm-py storage")
             return tokens
         except Exception as e:
             raise RuntimeError(
-                "No NotebookLM authentication found. Run: smallclaw login"
+                "No NotebookLM authentication found. "
+                "Run: smallclaw login  (or: notebooklm login)"
             ) from e
 
 
-async def _load_auth(path: Path):
-    """Load auth tokens from a JSON file."""
-    from notebooklm.auth import AuthTokens, extract_cookies_from_storage, fetch_tokens
+def get_auth_sync(force_refresh: bool = False):
+    """Synchronous wrapper for get_auth().
 
-    data = json.loads(path.read_text())
-    cookies = extract_cookies_from_storage(data)
-    csrf, session_id = await fetch_tokens(cookies)
-    return AuthTokens(cookies=cookies, csrf_token=csrf, session_id=session_id)
+    Handles the case where we're already inside a running event loop
+    (e.g., inside smolagents CodeAgent) by running in a separate thread.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(lambda: asyncio.run(get_auth(force_refresh))).result()
+    else:
+        return asyncio.run(get_auth(force_refresh))
 
 
 def clear_cache() -> None:
@@ -90,15 +103,4 @@ def clear_cache() -> None:
 
 def ensure_authenticated() -> None:
     """Check if the user is authenticated, raising if not."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # We're inside an event loop — schedule it
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            pool.submit(lambda: asyncio.run(get_auth())).result()
-    else:
-        asyncio.run(get_auth())
+    get_auth_sync()
