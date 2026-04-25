@@ -1,18 +1,19 @@
-"""NLMAgent — Hybrid agent with fast/slow path routing.
+"""NLMAgent — Agent where NotebookLM IS the brain.
 
-Fast path: Direct Pipeline calls (no LLM).
-Slow path: CodeAgent with local SmolLM3 executor + NotebookLM knowledge tools.
+Uses OrchestratorModel (3-layer: reflex/cognition/memory) as the model
+and NLMTools as the hands. Every generate() call automatically:
+  1. Injects memory context from the notebook
+  2. Falls back to NotebookLM chat for unknowns
+  3. Auto-syncs results back to the notebook
 
-The slow path uses SmolLM3 (local, zero tokens) as the "hands" — deciding which
-tools to call — and NotebookLM as the "brain" — providing domain knowledge via
-the ask_notebook and other tools.
-
-All tools receive the notebook_id so they can operate on the right notebook.
+The agent doesn't "decide" to use NotebookLM — it IS NotebookLM.
 """
 
 import logging
 from smolagents import CodeAgent
 
+from smallclawlm.orchestrator import OrchestratorModel
+from smallclawlm.nlm_memory import NLMMemory
 from smallclawlm.nlm_tools import (
     ALL_TOOLS, RESEARCH_TOOLS, PODCAST_TOOLS, QUIZ_TOOLS,
     REPORT_TOOLS, MINDMAP_TOOLS,
@@ -29,33 +30,59 @@ TOOL_PRESETS = {
     "all": ALL_TOOLS,
 }
 
-DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by SmolLM3 and Google NotebookLM.
-You have access to notebook tools for research, content generation, and analysis.
+SYSTEM_INSTRUCTIONS = """You are SmallClawLM — an AI agent that IS NotebookLM.
+You don't just USE NotebookLM, you LIVE in it. Every fact, research result, and
+decision is automatically stored in your notebook memory.
+
+Your memory grows with every session. When you're uncertain, you automatically
+query your accumulated knowledge. When you research, results become permanent.
 
 IMPORTANT RULES:
 1. Use tools to gather information before answering.
 2. When you have enough information, call final_answer() with your complete response.
 3. If a tool returns an error, read the suggested fix and try again.
-4. Always call final_answer() when done — it is the ONLY way to end execution.
-5. Keep your code blocks simple — one tool call per block.
-6. When calling tools, use exact parameter names from the tool descriptions.
+4. Always call final_answer() when done — it's the ONLY way to end execution.
+5. Keep code blocks simple — one tool call per block.
+6. Use exact parameter names from tool descriptions.
 """
 
 
-class NLMAgent:
-    """One agent, one notebook, one specialty.
+def create_agent(
+    notebook_id: str | None = None,
+    notebook_title: str = "SmallClawLM Agent",
+    tools: str | list[type] = "all",
+    model_path: str | None = None,
+    n_threads: int = 4,
+    n_ctx: int = 2048,
+    **kwargs,
+) -> "NLMAgent":
+    """Factory function to create an agent with sensible defaults."""
+    agent = NLMAgent(
+        notebook_id=notebook_id,
+        notebook_title=notebook_title,
+        tools=tools,
+        model_path=model_path,
+        n_threads=n_threads,
+        n_ctx=n_ctx,
+        **kwargs,
+    )
+    return agent
 
-    Uses SmolLM3 (local) as the executor and NotebookLM tools as knowledge.
-    No external LLM API keys required when using smollm backend.
+
+class NLMAgent:
+    """One agent, one notebook, one brain.
+
+    The OrchestratorModel handles the 3-layer architecture automatically.
+    The agent just calls tools and returns answers — memory and cognition
+    are built into every generate() call.
 
     Args:
         notebook_id: NotebookLM notebook ID. Auto-creates one if None.
         notebook_title: Title for auto-created notebook.
         tools: Tool preset name ("all", "research", etc.) or list of tool classes.
-        model_backend: "smollm" (local SmolLM3, zero tokens) or "nlm" (NotebookLM cloud).
         model_path: Path to GGUF model file (smollm backend only).
-        model_n_ctx: Context window size (smollm backend only).
-        model_temperature: Sampling temperature (smollm backend only).
+        n_threads: Number of threads for SmolLM3 (optimal: 4 for dual-channel DDR4).
+        n_ctx: Context window size for SmolLM3.
     """
 
     def __init__(
@@ -66,19 +93,13 @@ class NLMAgent:
         instructions: str | None = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
-        max_steps: int = 10,
-        verbosity_level: int = 1,
-        upload_sources: list[str] | None = None,
-        # Model configuration
-        model_backend: str = "smollm",
         model_path: str | None = None,
-        model_n_ctx: int = 4096,
-        model_n_gpu_layers: int = -1,
-        model_temperature: float = 0.3,
+        n_threads: int = 4,
+        n_ctx: int = 2048,
+        n_gpu_layers: int = 0,
     ):
         self._notebook_id = notebook_id
-        self._upload_sources = upload_sources or []
-        self._model_backend = model_backend
+        self._notebook_title = notebook_title or "SmallClawLM Agent"
 
         # Resolve tool preset
         if isinstance(tools, str):
@@ -86,50 +107,67 @@ class NLMAgent:
         else:
             tool_classes = tools
 
-        # Instantiate tools and inject notebook_id
-        tool_instances = []
-        for cls in tool_classes:
-            inst = cls()
-            # Inject notebook_id into tools that need it
-            if notebook_id:
-                inst._notebook_id = notebook_id
-            tool_instances.append(inst)
+        # Instantiate tools
+        self._tool_instances = [cls() for cls in tool_classes]
 
-        # Create model based on backend choice
-        model_backend = model_backend.lower()
-        if model_backend == "smollm":
-            from smallclawlm.smollm_model import SmolLMModel
-            model = SmolLMModel(
-                model_path=model_path,
-                n_ctx=model_n_ctx,
-                n_gpu_layers=model_n_gpu_layers,
-                temperature=model_temperature,
-            )
-        elif model_backend == "nlm":
-            from smallclawlm.nlm_model import NLMModel
-            model = NLMModel(
-                notebook_id=notebook_id,
-                notebook_title=notebook_title or "SmallClawLM Agent",
-                auto_create=True,
-            )
-        else:
-            raise ValueError(f"Unknown model backend: {model_backend}. Use 'smollm' or 'nlm'.")
+        # Set notebook_id on all tools
+        if notebook_id:
+            for tool in self._tool_instances:
+                tool._notebook_id = notebook_id
 
-        self.agent = CodeAgent(
-            model=model,
-            tools=tool_instances,
-            instructions=instructions or DEFAULT_INSTRUCTIONS,
-            max_steps=max_steps,
-            verbosity_level=verbosity_level,
+        # Create OrchestratorModel (3-layer brain)
+        self._memory = NLMMemory(
+            notebook_id=notebook_id,
+            notebook_title=self._notebook_title,
+        )
+        self._model = OrchestratorModel(
+            memory=self._memory,
+            notebook_id=notebook_id,
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers,
+        )
+
+        # Build the CodeAgent
+        self._agent = CodeAgent(
+            model=self._model,
+            tools=self._tool_instances,
+            instructions=instructions or SYSTEM_INSTRUCTIONS,
             additional_authorized_imports=additional_authorized_imports or [],
             planning_interval=planning_interval,
         )
 
-    def run(self, task: str) -> str:
-        """Run a task and return the result."""
-        return self.agent.run(task)
+    @property
+    def memory(self) -> NLMMemory:
+        """Access the agent's persistent memory."""
+        return self._memory
 
+    @property
+    def model(self) -> OrchestratorModel:
+        """Access the orchestrator model."""
+        return self._model
 
-def create_agent(specialty: str = "all", **kwargs) -> NLMAgent:
-    """Convenience factory for creating agents by specialty."""
-    return NLMAgent(tools=specialty, **kwargs)
+    @property
+    def notebook_id(self) -> str | None:
+        """Get the notebook ID (resolves lazily)."""
+        return self._memory.notebook_id
+
+    def run(self, task: str, **kwargs):
+        """Run a task through the agent.
+
+        Every call automatically:
+        1. Injects memory context
+        2. Uses SmolLM3 for tool selection (reflex)
+        3. Escalates to NotebookLM for unknowns (cognition)
+        4. Auto-syncs results to memory
+        """
+        try:
+            result = self._agent.run(task, **kwargs)
+            # Auto-sync the result to memory
+            if result:
+                self._memory.add_observation("agent_result", str(result)[:500])
+            return result
+        except Exception as e:
+            self._memory.add(f"Agent error: {e}")
+            raise
