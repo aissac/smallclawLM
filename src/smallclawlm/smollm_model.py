@@ -20,6 +20,7 @@ template registration, using raw completion API instead.
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -34,40 +35,34 @@ DEFAULT_MODEL_FILE = "smollm3-3b-q4_k_m.gguf"
 
 # /no_think mode system prompt with python_tools instructions
 SYSTEM_PROMPT = """<|im_start|>system
-/no_think
-You are an AI assistant with access to tools. When you need to call a tool, output Python code inside <code> tags like this:
-<code>
-tool_name(argument="value")
-</code>
+/nosplit
 
-When you have the final answer, call final_answer() with your complete response.
+You are a tool-calling assistant. You MUST output Python code inside <code> tags.
 
-Available tools will be described below. Always use tools to gather information before answering.
-"""
+Rules:
+1. When you need to call a tool, output EXACTLY: <code>tool_name(args)</code>
+2. When done, output: <code>final_answer(your_answer)</code>
+3. Do NOT output any other format — no markdown, no ```python```, no plain text.
+4. Only call tools that are listed below.
+5. One tool call per <code> block.
+
+Available tools:"""
 
 
 def _load_llm_bypassing_chat_template(model_path, n_ctx, n_gpu_layers, n_threads):
-    """Load a GGUF model, bypassing SmolLM3's broken {% generation %} jinja2 template.
-
-    SmolLM3's chat template uses {% generation %} tags that aren't in the jinja2
-    standard. llama-cpp-python tries to parse this during Llama.__init__ and fails.
-    We monkey-patch Jinja2ChatFormatter.__init__ to catch and skip the broken template.
-    """
+    """Load a GGUF model, bypassing SmolLM3's broken {% generation %} jinja2 template."""
     from llama_cpp import Llama
     import llama_cpp.llama_chat_format as lcf
 
     _orig_formatter_init = lcf.Jinja2ChatFormatter.__init__
 
     def _safe_formatter_init(self_fmt, template, *a, **kw):
-        """Catch TemplateSyntaxError from SmolLM3's {% generation %} tags."""
         try:
             return _orig_formatter_init(self_fmt, template, *a, **kw)
         except Exception:
-            # Skip — we use raw completion API, not create_chat_completion
-            # Make this formatter a no-op so __init__ can continue
+            # Skip broken templates — we use raw completion API
             self_fmt.template = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
             self_fmt.add_generation_prompt = kw.get("add_generation_prompt", True)
-            # Re-parse the simple template
             from jinja2 import Environment
             self_fmt._template = Environment().from_string(self_fmt.template)
 
@@ -86,14 +81,35 @@ def _load_llm_bypassing_chat_template(model_path, n_ctx, n_gpu_layers, n_threads
     return llm
 
 
+def _strip_thinking_tags(text: str) -> str:
+    """Remove SmolLM3's <think>...</think>\n\n<thought>...</thought>\n\n<answer>...</answer> reasoning markers.
+
+    SmolLM3 /no_think mode still outputs:
+      思考\n\n...
+解决方案\n<code>final_answer(...)</code>\n    We strip everything before the first <code> tag, and also remove the
+    trailing </answer>\n markers.
+    """
+    # Remove <think>...</think> blocks
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    # Remove 思考\n\n解决方案\n preamble before <code>
+    # Keep everything from the first <code> tag onward
+    code_match = re.search(r'<code>', text)
+    if code_match:
+        text = text[code_match.start():]
+    # Clean trailing markers
+    text = text.replace('</answer>\n', '').replace('</answer>', '')
+    text = text.replace('</thought>', '').replace('</thought>\n', '')
+    return text.strip()
+
+
 class SmolLMModel(Model):
     """smolagents Model backed by local SmolLM3-3B via llama-cpp-python.
 
     Zero external tokens. Runs entirely on local CPU/GPU.
     Outputs <code>tool()</code> blocks natively for smolagents CodeAgent.
 
-    Uses raw completion API (not create_chat_completion) to avoid
-    SmolLM3's broken {% generation %} jinja2 chat template.
+    Uses raw completion API to bypass SmolLM3's broken jinja2 chat template.
+    Strips 思考/解决方案 reasoning markers from /no_think mode.
     """
 
     def __init__(
@@ -102,7 +118,7 @@ class SmolLMModel(Model):
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
         n_threads: Optional[int] = None,
-        temperature: float = 0.3,
+        temperature: float = 0.1,
         max_tokens: int = 1024,
         model_id: str = "SmolLM3-3B-Q4_K_M",
         **kwargs,
@@ -147,10 +163,11 @@ class SmolLMModel(Model):
         """Generate a response using local SmolLM3 inference.
 
         Constructs a chatml prompt manually and uses raw completion API.
+        Strips SmolLM3's thinking/reasoning markers before returning.
         """
         self._load_model()
 
-        # Build prompt: system + tools + message history
+        # Build system prompt with tool descriptions
         system_text = SYSTEM_PROMPT
 
         if tools_to_call_from:
@@ -168,9 +185,9 @@ class SmolLMModel(Model):
                             sig = f"({', '.join(params)})"
                     tool_descs.append(f"- {tool.name}{sig}: {tool.description}")
             if tool_descs:
-                system_text += "\nTools:\n" + "\n".join(tool_descs) + "\n\n"
+                system_text += "\n" + "\n".join(tool_descs)
 
-        system_text += "<|im_end|>\n"
+        system_text += "\n<|im_end|>\n"
 
         prompt_parts = [system_text]
 
@@ -190,7 +207,7 @@ class SmolLMModel(Model):
                 role_tag = "system"
 
             if msg.role == MessageRole.ASSISTANT:
-                truncated = content[:800] if len(content) > 800 else content
+                truncated = content[:500] if len(content) > 500 else content
                 prompt_parts.append(f"<|im_start|>{role_tag}\n{truncated}<|im_end|>")
             else:
                 prompt_parts.append(f"<|im_start|>{role_tag}\n{content}<|im_end|>")
@@ -203,12 +220,11 @@ class SmolLMModel(Model):
         if len(full_prompt) > max_prompt_chars:
             full_prompt = full_prompt[:max_prompt_chars] + "\n<|im_end|>\n<|im_start|>assistant\n"
 
-        # Stop sequences
+        # Stop sequences — include SmolLM3 reasoning markers to cut off early
         stops = list(stop_sequences) if stop_sequences else []
-        if "<|im_end|>" not in stops:
-            stops.append("<|im_end|>")
-        if "<|im_start|>" not in stops:
-            stops.append("<|im_start|>")
+        for s in ["<|im_end|>", "<|im_start|>"]:
+            if s not in stops:
+                stops.append(s)
 
         try:
             response = self._llm(
@@ -225,15 +241,15 @@ class SmolLMModel(Model):
 
         except Exception as e:
             logger.error(f"SmolLM3 inference error: {e}")
-            generated = 'final_answer("Error: local model inference failed.")'
+            generated = '<code>final_answer("Error: local model inference failed.")</code>'
             prompt_tokens = 0
             completion_tokens = 0
 
-        # Clean up any trailing tokens
-        generated = generated.replace("<|im_end|>", "").strip()
+        # Strip SmolLM3 thinking markers
+        generated = _strip_thinking_tags(generated)
 
-        if not generated:
-            generated = 'final_answer("I could not generate a response. Please try again.")'
+        if not generated or not generated.strip():
+            generated = '<code>final_answer("I could not generate a response.")</code>'
 
         return ChatMessage(
             role=MessageRole.ASSISTANT,

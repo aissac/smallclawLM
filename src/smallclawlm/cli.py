@@ -1,7 +1,11 @@
 """SmallClawLM CLI — Hybrid Fast/Slow Path routing.
 
 Fast path: Direct Pipeline calls for known intents (podcast, report, etc.)
-Slow path: Full CodeAgent with NLMModel reasoning for complex tasks
+Slow path: CodeAgent with SmolLM3 executor + NotebookLM knowledge tools
+
+Model backends:
+  smollm (default): Local SmolLM3-3B via llama-cpp-python (zero external tokens)
+  nlm:              Google NotebookLM chat API (requires auth, uses Gemini)
 
 Commands:
   smallclaw run "task"       # Auto-routes: fast path for tool intents, slow for reasoning
@@ -120,7 +124,7 @@ async def _fast_path(intent: str, params: dict, notebook_id: str | None):
         return f"Unknown intent: {intent}"
 
 
-async def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10):
+async def _slow_nlm_path(task: str, notebook_id: str | None, max_steps: int = 10):
     """Execute a task using NLMAgent with NLMModel brain — for complex reasoning."""
     from smallclawlm import NLMAgent
 
@@ -128,6 +132,20 @@ async def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10):
         notebook_id=notebook_id,
         tools="all",
         max_steps=max_steps,
+        model_backend="nlm",
+    )
+    return agent.run(task)
+
+
+def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10, model_backend: str = "smollm"):
+    """Execute a task using NLMAgent — SmolLM3 (local) or NLM (cloud)."""
+    from smallclawlm import NLMAgent
+
+    agent = NLMAgent(
+        notebook_id=notebook_id,
+        tools="all",
+        max_steps=max_steps,
+        model_backend=model_backend,
     )
     return agent.run(task)
 
@@ -135,9 +153,9 @@ async def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10):
 # ─── CLI Commands ───
 
 @click.group()
-@click.version_option(version="0.3.0", prog_name="smallclaw")
+@click.version_option(version="0.4.0", prog_name="smallclaw")
 def cli():
-    """SmallClawLM - Zero-token AI agent powered by Google NotebookLM."""
+    """SmallClawLM - Zero-token AI agent powered by SmolLM3 + NotebookLM."""
     pass
 
 
@@ -171,14 +189,20 @@ def auth_check(notebook_id):
 @click.argument("task")
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 @click.option("--max-steps", "-m", default=10, help="Max agent steps (slow path only)")
+@click.option("--model", "model_backend", type=click.Choice(["smollm", "nlm"]), default="smollm",
+              help="Model backend: smollm (local SmolLM3) or nlm (NotebookLM cloud)")
 @click.option("--force-slow", is_flag=True, help="Force slow path (agent) even for known intents")
 @click.option("--force-fast", is_flag=True, help="Force fast path (pipeline) even for conversational input")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def run(task, notebook_id, max_steps, force_slow, force_fast, verbose):
+def run(task, notebook_id, max_steps, model_backend, force_slow, force_fast, verbose):
     """Run a task with automatic fast/slow path routing.
 
     By default, the router determines whether to use fast path (direct tool call)
     or slow path (agent reasoning). Use --force-slow or --force-fast to override.
+
+    Model backends:
+      smollm (default): Local SmolLM3-3B, zero external tokens
+      nlm: NotebookLM chat API (requires auth)
     """
     if force_fast and force_slow:
         click.echo("Error: cannot use both --force-fast and --force-slow", err=True)
@@ -189,6 +213,7 @@ def run(task, notebook_id, max_steps, force_slow, force_fast, verbose):
 
     if verbose:
         click.echo(f"Route: {result.path.value} path → {result.intent} (confidence: {result.confidence:.0%})")
+        click.echo(f"Model: {model_backend}")
 
     # Override if requested
     if force_slow:
@@ -209,8 +234,8 @@ def run(task, notebook_id, max_steps, force_slow, force_fast, verbose):
         output = _run_async(_fast_path(result.intent, result.params, notebook_id))
     else:
         if verbose:
-            click.echo(f"Slow path: agent reasoning")
-        output = _slow_path(task, notebook_id, max_steps)
+            click.echo(f"Slow path: {model_backend} agent")
+        output = _slow_path(task, notebook_id, max_steps, model_backend)
 
     click.echo(output)
 
@@ -218,19 +243,28 @@ def run(task, notebook_id, max_steps, force_slow, force_fast, verbose):
 @cli.command()
 @click.option("--notebook-id", "-n", default=None, help="NotebookLM notebook ID")
 @click.option("--max-steps", "-m", default=10, help="Max agent steps")
+@click.option("--model", "model_backend", type=click.Choice(["smollm", "nlm"]), default="smollm",
+              help="Model backend: smollm (local) or nlm (cloud)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def agent(notebook_id, max_steps, verbose):
-    """Start an interactive agent session (always slow path)."""
+def agent(notebook_id, max_steps, model_backend, verbose):
+    """Start an interactive agent session (always slow path).
+
+    Model backends:
+      smollm (default): Local SmolLM3-3B, zero external tokens
+      nlm: NotebookLM chat API (requires auth)
+    """
     from smallclawlm import NLMAgent
 
     nlm_agent = NLMAgent(
         notebook_id=notebook_id,
         tools="all",
         max_steps=max_steps,
+        model_backend=model_backend,
         verbosity_level=2 if verbose else 1,
     )
 
-    click.echo("SmallClawLM Agent (slow path - full reasoning)")
+    model_label = "SmolLM3 (local)" if model_backend == "smollm" else "NotebookLM (cloud)"
+    click.echo(f"SmallClawLM Agent (slow path — {model_label})")
     click.echo("Type your tasks, Ctrl+C to exit")
     click.echo("=" * 50)
 
@@ -242,7 +276,7 @@ def agent(notebook_id, max_steps, verbose):
             result = nlm_agent.run(task)
             click.echo(result)
         except KeyboardInterrupt:
-            click.echo("Bye!")
+            click.echo("\nBye!")
             break
 
 

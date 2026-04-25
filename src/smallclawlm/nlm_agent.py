@@ -3,14 +3,11 @@
 Fast path: Direct Pipeline calls (no LLM).
 Slow path: CodeAgent with local SmolLM3 executor + NotebookLM knowledge tools.
 
-Architecture:
-  Fast path:  user input → router → Pipeline → direct API call → result
-  Slow path:  user input → router → NLMAgent → SmolLMModel.generate()
-              → <code>tool_call()</code> → CodeAgent executes tools → result
+The slow path uses SmolLM3 (local, zero tokens) as the "hands" — deciding which
+tools to call — and NotebookLM as the "brain" — providing domain knowledge via
+the ask_notebook and other tools.
 
-The slow path uses SmolLM3-3B as the "hands" (executor that decides which
-tools to call) and NotebookLM as the "brain" (domain knowledge via tools).
-All inference is local — zero external tokens required.
+All tools receive the notebook_id so they can operate on the right notebook.
 """
 
 import logging
@@ -32,7 +29,7 @@ TOOL_PRESETS = {
     "all": ALL_TOOLS,
 }
 
-DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by local SmolLM3 and Google NotebookLM.
+DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by SmolLM3 and Google NotebookLM.
 You have access to notebook tools for research, content generation, and analysis.
 
 IMPORTANT RULES:
@@ -49,7 +46,16 @@ class NLMAgent:
     """One agent, one notebook, one specialty.
 
     Uses SmolLM3 (local) as the executor and NotebookLM tools as knowledge.
-    No external LLM API keys required.
+    No external LLM API keys required when using smollm backend.
+
+    Args:
+        notebook_id: NotebookLM notebook ID. Auto-creates one if None.
+        notebook_title: Title for auto-created notebook.
+        tools: Tool preset name ("all", "research", etc.) or list of tool classes.
+        model_backend: "smollm" (local SmolLM3, zero tokens) or "nlm" (NotebookLM cloud).
+        model_path: Path to GGUF model file (smollm backend only).
+        model_n_ctx: Context window size (smollm backend only).
+        model_temperature: Sampling temperature (smollm backend only).
     """
 
     def __init__(
@@ -72,6 +78,7 @@ class NLMAgent:
     ):
         self._notebook_id = notebook_id
         self._upload_sources = upload_sources or []
+        self._model_backend = model_backend
 
         # Resolve tool preset
         if isinstance(tools, str):
@@ -79,7 +86,14 @@ class NLMAgent:
         else:
             tool_classes = tools
 
-        tool_instances = [cls() for cls in tool_classes]
+        # Instantiate tools and inject notebook_id
+        tool_instances = []
+        for cls in tool_classes:
+            inst = cls()
+            # Inject notebook_id into tools that need it
+            if notebook_id:
+                inst._notebook_id = notebook_id
+            tool_instances.append(inst)
 
         # Create model based on backend choice
         model_backend = model_backend.lower()
