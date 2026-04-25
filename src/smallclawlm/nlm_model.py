@@ -1,40 +1,81 @@
-"""NLMModel — smolagents Model backed by a single NotebookLM notebook.
+"""NLMModel — Tool-routing model for smolagents CodeAgent.
 
-One agent = one notebook = one specialty brain.
-The model calls chat.ask() on its notebook for every generate() call.
+Does NOT call chat.ask() directly. Instead, generates code-block
+instructions telling the agent which tool to call. The actual
+NotebookLM interaction happens inside the tools, which use
+simple prompts that the parser can handle reliably.
 
-Key design decisions (validated with NotebookLM):
-- Stateless chat: conversation_id=None (smolagents manages its own history)
-- ChatMode.CONCISE: shorter responses = faster agent loops
-- Exponential backoff: handle ChatError rate limits gracefully
-- Auth refresh: auto-recover from expired tokens via refresh_auth()
-- Source wait: tools must wait for source processing before next generate()
+Architecture:
+  User task → NLMModel.generate() → "<code>tool_call()</code>" → CodeAgent executes tool → NotebookLM
 """
 
 import asyncio
 import logging
 import threading
-import time
 from typing import Any
 
 from smolagents.models import ChatMessage, MessageRole, Model
 from smolagents.monitoring import TokenUsage
 
-from smallclawlm.auth import get_auth
-
 logger = logging.getLogger(__name__)
 
-# Retry config for rate limits
-_MAX_RETRIES = 3
-_RETRY_DELAYS = (2, 4, 8)
+# Tool routing rules — maps task intent to tool calls
+_ROUTING_RULES = [
+    {
+        "keywords": ["list sources", "list the sources", "what sources", "show sources", "loaded sources"],
+        "tool": "list_sources",
+        "code": "<code>\nlist_sources()\n</code>",
+    },
+    {
+        "keywords": ["add source", "add a source", "add url", "load url", "import source"],
+        "tool": "add_source",
+        "code": '<code>\nadd_source(url="<URL>")\n</code>',
+    },
+    {
+        "keywords": ["create notebook", "new notebook", "make notebook"],
+        "tool": "create_notebook",
+        "code": '<code>\ncreate_notebook(title="<TITLE>")\n</code>',
+    },
+    {
+        "keywords": ["research", "deep research", "investigate", "look up", "find out"],
+        "tool": "deep_research",
+        "code": '<code>\ndeep_research(query="<QUERY>")\n</code>',
+    },
+    {
+        "keywords": ["podcast", "audio overview", "generate audio"],
+        "tool": "generate_podcast",
+        "code": "<code>\ngenerate_podcast()\n</code>",
+    },
+    {
+        "keywords": ["video", "generate video", "explainer video"],
+        "tool": "generate_video",
+        "code": "<code>\ngenerate_video()\n</code>",
+    },
+    {
+        "keywords": ["quiz", "test me", "questions", "generate quiz"],
+        "tool": "generate_quiz",
+        "code": "<code>\ngenerate_quiz()\n</code>",
+    },
+    {
+        "keywords": ["mind map", "mindmap", "connections", "concept map"],
+        "tool": "generate_mind_map",
+        "code": "<code>\ngenerate_mind_map()\n</code>",
+    },
+    {
+        "keywords": ["report", "summary report", "generate report"],
+        "tool": "generate_report",
+        "code": "<code>\ngenerate_report()\n</code>",
+    },
+]
 
 
 class NLMModel(Model):
-    """smolagents Model using a single NotebookLM notebook as the LLM backend.
+    """smolagents Model that routes tasks to NotebookLM tools.
 
-    Each agent gets one notebook with its own domain sources.
-    All reasoning powered by Gemini inside Google's NotebookLM.
-    No external LLM API keys required.
+    Instead of calling chat.ask() (which has parser issues),
+    this model analyzes the task and returns a <code> block
+    telling CodeAgent which tool to invoke. The actual NotebookLM
+    interaction happens inside the tools.
     """
 
     def __init__(
@@ -42,24 +83,23 @@ class NLMModel(Model):
         notebook_id: str | None = None,
         notebook_title: str | None = None,
         auto_create: bool = True,
-        concise: bool = True,
-        model_id: str = "notebooklm-gemini",
+        model_id: str = "notebooklm-router",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._notebook_id = notebook_id
         self._notebook_title = notebook_title or "SmallClawLM Agent"
         self._auto_create = auto_create
-        self._concise = concise
         self.model_id = model_id
 
-        # Daemon event loop for async/sync bridging
+        # Daemon event loop for async/sync bridging (used by tools)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
 
         self._client = None
         self._auth = None
+        self._step_count = 0
 
     def _run_async(self, coro):
         """Submit async coroutine to daemon loop, blocking until done."""
@@ -67,19 +107,17 @@ class NLMModel(Model):
         return future.result()
 
     async def _ensure_client(self):
-        """Get or create the NotebookLM client and notebook."""
+        """Get or create the NotebookLM client."""
         if self._client is not None:
             return
-
         from notebooklm import NotebookLMClient
+        from smallclawlm.auth import get_auth
         self._auth = await get_auth()
         self._client = NotebookLMClient(self._auth)
         await self._client.__aenter__()
 
-
-
     async def _ensure_notebook(self):
-        """Ensure we have a notebook ID and chat mode is set."""
+        """Ensure we have a notebook ID."""
         await self._ensure_client()
         if self._notebook_id is not None:
             return
@@ -89,61 +127,6 @@ class NLMModel(Model):
         self._notebook_id = nb.id
         logger.info(f"Auto-created notebook: {nb.id} ({nb.title})")
 
-        # NOTE: ChatMode.CONCISE breaks chat.ask() (timeout/parse failure)
-        # Using DEFAULT mode which works reliably.
-
-    async def _chat_with_retry(self, question: str) -> str:
-        """Call chat.ask() with exponential backoff for rate limits."""
-        await self._ensure_notebook()
-
-        for attempt in range(_MAX_RETRIES):
-            try:
-                result = await self._client.chat.ask(
-                    self._notebook_id,
-                    question,
-                    conversation_id=None,  # Always stateless
-                )
-                answer = result.answer if hasattr(result, "answer") else str(result)
-                if not answer or not answer.strip():
-                    logger.warning(f"Empty answer from NotebookLM for prompt: {question[:200]}")
-                    return ""
-                return answer
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                is_rate_limit = "rate limit" in error_msg or "429" in error_msg
-                is_auth_error = "csrf" in error_msg or "session" in error_msg or "401" in error_msg
-                is_network_error = "timeout" in error_msg or "connection" in error_msg
-
-                if is_auth_error and attempt == 0:
-                    # Try refreshing auth once
-                    logger.warning(f"Auth error, refreshing tokens: {e}")
-                    try:
-                        self._auth = await get_auth(force_refresh=True)
-                        self._client = NotebookLMClient(self._auth)
-                        await self._client.__aenter__()
-                        continue
-                    except Exception:
-                        pass
-
-                if is_rate_limit and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-                    logger.warning(f"Rate limited, retrying in {delay}s (attempt {attempt+1})")
-                    await asyncio.sleep(delay)
-                    continue
-
-                if is_network_error and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-                    logger.warning(f"Network error, retrying in {delay}s: {e}")
-                    await asyncio.sleep(delay)
-                    continue
-
-                # Unrecoverable or exhausted retries
-                logger.error(f"chat.ask() failed after {attempt+1} attempts: {e}")
-                return f"Error: {e}"
-
-        return "Error: Max retries exceeded"
-
     def generate(
         self,
         messages: list[ChatMessage],
@@ -152,63 +135,90 @@ class NLMModel(Model):
         tools_to_call_from: list[Any] | None = None,
         **kwargs,
     ) -> ChatMessage:
-        """Generate a response using NotebookLM chat API.
+        """Route the task to the appropriate tool via <code> blocks.
 
-        Smolagents passes its full message history. We flatten it into
-        a compact prompt string rather than passing conversation_id,
-        keeping NotebookLM stateless on its side.
+        Step 1: Route task → tool call code block
+        Step 2: After tool returns, call final_answer with results
         """
-        return self._run_async(self._agenerate(messages, stop_sequences, **kwargs))
+        self._step_count += 1
+        task = self._extract_task(messages)
 
-    async def _agenerate(
-        self,
-        messages: list[ChatMessage],
-        stop_sequences: list[str] | None = None,
-        **kwargs,
-    ) -> ChatMessage:
-        prompt = self._messages_to_prompt(messages)
+        # Step 2+: If we have tool output, deliver final answer
+        last_obs = self._get_last_observation(messages)
+        if last_obs and self._step_count > 1:
+            content = '<code>\nfinal_answer(answer="' + self._escape(last_obs) + '")\n</code>'
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=content,
+                token_usage=TokenUsage(input_tokens=0, output_tokens=0),
+            )
 
-        content = await self._chat_with_retry(prompt)
-
-        if stop_sequences:
-            from smolagents.models import remove_content_after_stop_sequences
-            content = remove_content_after_stop_sequences(content, stop_sequences)
-
+        # Step 1: Route task to tool
+        routed = self._route(task)
         return ChatMessage(
             role=MessageRole.ASSISTANT,
-            content=content,
+            content=routed,
             token_usage=TokenUsage(input_tokens=0, output_tokens=0),
         )
 
-    _CODING_INSTRUCTION = (
-        "IMPORTANT: When you need to use a tool, output a Python code block using this format:\n"
-        "<code>\n"
-        "tool_name(argument=value)\n"
-        "</code>\n"
-        "When you have the final answer, use: <code>final_answer(content=\"your answer\")</code>\n"
-        "Always wrap tool calls in <code> tags. Do not respond with plain text alone if a tool call is needed.\n"
-    )
+    def _extract_task(self, messages: list[ChatMessage]) -> str:
+        """Extract the user's task from the message history.
 
-    def _messages_to_prompt(self, messages: list[ChatMessage]) -> str:
-        """Flatten smolagents message history into a single prompt string.
-
-        NotebookLM is stateless per call (no conversation_id).
-        smolagents manages its own state — we flatten the full ReAct
-        history into the question text.
+        smolagents passes USER content as a list of dicts:
+        [{"type": "text", "text": "New task:\nActual task"}]
         """
-        role_labels = {
-            MessageRole.SYSTEM: "System",
-            MessageRole.USER: "User",
-            MessageRole.ASSISTANT: "Assistant",
-            MessageRole.TOOL_CALL: "Action",
-            MessageRole.TOOL_RESPONSE: "Observation",
-        }
-        parts = [self._CODING_INSTRUCTION]
-        for msg in messages:
-            label = role_labels.get(msg.role, str(msg.role))
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            # Truncate very long observations to keep prompt compact
-            if msg.role == MessageRole.TOOL_RESPONSE and len(content) > 1500:
-                content = content[:1500] + "\n...[truncated]"
-            parts.append(f"[{label}]: {content}")
-        return "\n\n".join(parts)
+        for msg in reversed(messages):
+            if msg.role == MessageRole.USER:
+                c = self._unwrap_content(msg.content)
+                if c.startswith("New task:\n"):
+                    c = c[len("New task:\n"):]
+                return c.strip()
+        return ""
+
+    @staticmethod
+    def _unwrap_content(content) -> str:
+        """Unwrap smolagents message content (may be str or list of dicts)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # [{"type": "text", "text": "..."}]
+            texts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    texts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    texts.append(item)
+            return " ".join(texts)
+        return str(content)
+
+    def _get_last_observation(self, messages: list[ChatMessage]) -> str:
+        """Get the last tool response from the history."""
+        for msg in reversed(messages):
+            if msg.role == MessageRole.TOOL_RESPONSE:
+                return self._unwrap_content(msg.content)
+        return ""
+
+    def _route(self, task: str) -> str:
+        """Determine which tool to call based on the task text.
+
+        Uses set-of-words matching: all words in a keyword must appear in the task.
+        Falls back to ask_notebook for unmatched tasks.
+        """
+        task_words = set(task.lower().split())
+
+        for rule in _ROUTING_RULES:
+            for kw in rule["keywords"]:
+                kw_words = set(kw.split())
+                if kw_words.issubset(task_words):
+                    logger.info(f"Routed to {rule['tool']} (matched '{kw}')")
+                    return rule["code"]
+
+        # Default: ask_notebook for general questions
+        escaped = self._escape(task)
+        logger.info(f"Routed to ask_notebook (no keyword match)")
+        return f'<code>\nask_notebook(question="{escaped}")\n</code>'
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape text for inclusion in a Python string literal."""
+        return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")[:2000]

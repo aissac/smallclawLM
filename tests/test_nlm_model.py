@@ -1,24 +1,21 @@
-"""Tests for NLMModel."""
+"""Tests for NLMModel initialization and routing logic."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from smolagents.models import ChatMessage, MessageRole
 
 from smallclawlm.nlm_model import NLMModel
 
 
 class TestNLMModel:
-    """Test NLMModel initialization and message conversion."""
+    """Test NLMModel initialization and core methods."""
 
     def test_init_defaults(self):
-        """NLMModel initializes with default values."""
         model = NLMModel()
-        assert model.model_id == "notebooklm-gemini"
+        assert model.model_id == "notebooklm-router"
         assert model._notebook_id is None
         assert model._auto_create is True
-        # _language removed in v0.2.0
 
     def test_init_custom(self):
-        """NLMModel accepts custom parameters."""
         model = NLMModel(
             notebook_id="test-nb-123",
             notebook_title="Test Notebook",
@@ -28,34 +25,14 @@ class TestNLMModel:
         assert model._notebook_title == "Test Notebook"
         assert model.model_id == "custom-model"
 
-    def test_messages_to_prompt_system(self):
-        """System messages are prefixed correctly."""
-        from smolagents.models import ChatMessage, MessageRole
-
+    def test_route_returns_code_block(self):
         model = NLMModel()
-        messages = [ChatMessage(role=MessageRole.SYSTEM, content="You are helpful.")]
-        prompt = model._messages_to_prompt(messages)
-        assert "[System]: You are helpful." in prompt
+        result = model._route("research something")
+        assert result.startswith("<code>")
+        assert result.strip().endswith("</code>")
 
-    def test_messages_to_prompt_user(self):
-        """User messages are prefixed correctly."""
-        from smolagents.models import ChatMessage, MessageRole
-
-        model = NLMModel()
-        messages = [ChatMessage(role=MessageRole.USER, content="Hello")]
-        prompt = model._messages_to_prompt(messages)
-        assert "[User]: Hello" in prompt
-
-    def test_messages_to_prompt_mixed(self):
-        """Mixed messages are combined with double newlines."""
-        from smolagents.models import ChatMessage, MessageRole
-
-        model = NLMModel()
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content="Be helpful."),
-            ChatMessage(role=MessageRole.USER, content="Hi"),
-        ]
-        prompt = model._messages_to_prompt(messages)
-        assert "[System]: Be helpful." in prompt
-        assert "[User]: Hi" in prompt
-        assert "\n\n" in prompt
+    def test_escape_handles_special_chars(self):
+        escaped = NLMModel._escape('He said "hello"\nnew line\\backslash')
+        assert '\\"' in escaped
+        assert "\\n" in escaped
+        assert "\\\\" in escaped

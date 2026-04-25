@@ -1,117 +1,122 @@
-"""Unit tests for NLMModel with mocked NotebookLM client.
-
-We mock the async chat.ask() call to avoid needing real auth.
-"""
+"""Unit tests for NLMModel — tool-routing model."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 from smolagents.models import ChatMessage, MessageRole
 
 from smallclawlm.nlm_model import NLMModel
 
 
 class TestNLMModelInit:
-    def test_creates_with_defaults(self):
-        model = NLMModel.__new__(NLMModel)
-        # Can't call __init__ easily without mocking super().__init__
-        # but we can test the class exists and has expected attributes
-        assert hasattr(NLMModel, 'generate')
-        assert hasattr(NLMModel, '_agenerate')
-        assert hasattr(NLMModel, '_messages_to_prompt')
+    def test_has_generate(self):
+        assert hasattr(NLMModel, "generate")
 
-    def test_messages_to_prompt(self):
-        model = NLMModel.__new__(NLMModel)
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content="You are an agent"),
-            ChatMessage(role=MessageRole.USER, content="Research fusion energy"),
-        ]
-        prompt = NLMModel._messages_to_prompt(model, messages)
-        assert "[System]" in prompt
-        assert "[User]" in prompt
-        assert "Research fusion energy" in prompt
+    def test_has_route(self):
+        assert hasattr(NLMModel, "_route")
 
-    def test_messages_to_prompt_truncates_long_observations(self):
-        model = NLMModel.__new__(NLMModel)
-        messages = [
-            ChatMessage(role=MessageRole.TOOL_RESPONSE, content="x" * 3000),
-        ]
-        prompt = NLMModel._messages_to_prompt(model, messages)
-        assert "truncated" in prompt
-        assert len(prompt) < 2000  # Much shorter than 3000 chars
+    def test_has_extract_task(self):
+        assert hasattr(NLMModel, "_extract_task")
+
+
+class TestNLMModelRouting:
+    """Test that the model routes tasks to the correct tool calls."""
+
+    @pytest.fixture
+    def model(self):
+        return NLMModel(notebook_id="test-nb")
+
+    def test_route_research(self, model):
+        result = model._route("research fusion energy")
+        assert "deep_research" in result
+        assert "<code>" in result
+
+    def test_route_list_sources(self, model):
+        result = model._route("list the sources in this notebook")
+        assert "list_sources" in result
+        assert "<code>" in result
+
+    def test_route_podcast(self, model):
+        result = model._route("generate a podcast about AI")
+        assert "generate_podcast" in result
+
+    def test_route_quiz(self, model):
+        result = model._route("create a quiz on this topic")
+        assert "generate_quiz" in result
+
+    def test_route_mindmap(self, model):
+        result = model._route("create a mind map of the concepts")
+        assert "generate_mind_map" in result
+
+    def test_route_report(self, model):
+        result = model._route("generate a summary report")
+        assert "generate_report" in result
+
+    def test_route_video(self, model):
+        result = model._route("make a video explainer")
+        assert "generate_video" in result
+
+    def test_route_add_source(self, model):
+        result = model._route("add this url as a source")
+        assert "add_source" in result
+
+    def test_route_create_notebook(self, model):
+        result = model._route("create a new notebook")
+        assert "create_notebook" in result
+
+    def test_route_default_ask(self, model):
+        """Unknown tasks route to ask_notebook."""
+        result = model._route("What is the meaning of life?")
+        assert "ask_notebook" in result
 
 
 class TestNLMModelGenerate:
-    """Test generate() with mocked async client."""
+    """Test generate() returns proper ChatMessage with code blocks."""
 
     @pytest.fixture
-    def mock_model(self):
-        """Create an NLMModel with mocked internals."""
-        model = NLMModel(notebook_id="test-notebook-123", auto_create=False)
-        # Simulate client being ready
-        model._client = MagicMock()
-        return model
+    def model(self):
+        return NLMModel(notebook_id="test-nb")
 
-    def test_generate_returns_chat_message(self, mock_model):
-        """Verify generate() returns a smolagents ChatMessage."""
-        # Mock the async chain
-        mock_result = MagicMock()
-        mock_result.answer = "Test response from NotebookLM"
-
-        async def mock_chat_ask(*args, **kwargs):
-            return mock_result
-
-        mock_model._client.chat = MagicMock()
-        mock_model._client.chat.ask = mock_chat_ask
-
-        messages = [ChatMessage(role=MessageRole.USER, content="Test query")]
-        result = mock_model.generate(messages)
-
+    def test_generate_returns_chat_message(self, model):
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content="You are an agent"),
+            ChatMessage(role=MessageRole.USER, content="New task:\nResearch AI"),
+        ]
+        result = model.generate(messages)
         assert isinstance(result, ChatMessage)
         assert result.role == MessageRole.ASSISTANT
-        assert result.content == "Test response from NotebookLM"
+        assert "<code>" in result.content
+        assert "deep_research" in result.content
 
-    def test_generate_handles_error_gracefully(self, mock_model):
-        """Verify generate() returns error as content, not exception."""
-        async def mock_chat_ask(*args, **kwargs):
-            raise RuntimeError("ChatError: rate limited")
+    def test_generate_routes_general_question(self, model):
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content="You are an agent"),
+            ChatMessage(role=MessageRole.USER, content="New task:\nWhat is this about?"),
+        ]
+        result = model.generate(messages)
+        assert "ask_notebook" in result.content
 
-        mock_model._client.chat = MagicMock()
-        mock_model._client.chat.ask = mock_chat_ask
+    def test_generate_final_answer_after_observation(self, model):
+        """After a tool returns results, the model should call final_answer."""
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content="You are an agent"),
+            ChatMessage(role=MessageRole.USER, content="New task:\nList sources"),
+            ChatMessage(role=MessageRole.ASSISTANT, content="<code>list_sources()</code>"),
+            ChatMessage(role=MessageRole.TOOL_CALL, content="list_sources()"),
+            ChatMessage(role=MessageRole.TOOL_RESPONSE, content="source1.md | READY\nsource2.py | READY"),
+        ]
+        model._step_count = 1  # Simulate being in step 2+
+        result = model.generate(messages)
+        assert "final_answer" in result.content
 
-        messages = [ChatMessage(role=MessageRole.USER, content="Test")]
-        result = mock_model.generate(messages)
+    def test_extract_task_strips_prefix(self, model):
+        messages = [
+            ChatMessage(role=MessageRole.USER, content="New task:\nResearch fusion"),
+        ]
+        task = model._extract_task(messages)
+        assert task == "Research fusion"
 
-        assert isinstance(result, ChatMessage)
-        assert "Error" in result.content
-
-
-class TestRetryLogic:
-    """Test that _chat_with_retry handles rate limits and auth errors."""
-
-    @pytest.fixture
-    def mock_model(self):
-        model = NLMModel(notebook_id="test-nb", auto_create=False)
-        model._client = MagicMock()
-        return model
-
-    def test_rate_limit_retries(self, mock_model):
-        """First call rate limited, second succeeds."""
-        call_count = 0
-
-        async def mock_ask(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Chat request was rate limited. Wait a few seconds.")
-            mock_result = MagicMock()
-            mock_result.answer = "Success on retry"
-            return mock_result
-
-        mock_model._client.chat = MagicMock()
-        mock_model._client.chat.ask = mock_ask
-
-        messages = [ChatMessage(role=MessageRole.USER, content="test")]
-        result = mock_model.generate(messages)
-
-        # Should have retried and eventually returned something
-        assert isinstance(result, ChatMessage)
+    def test_extract_task_no_prefix(self, model):
+        messages = [
+            ChatMessage(role=MessageRole.USER, content="Hello there"),
+        ]
+        task = model._extract_task(messages)
+        assert task == "Hello there"

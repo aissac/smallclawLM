@@ -321,23 +321,6 @@ class CreateNotebookTool(Tool, _ClientMixin):
             return f"Create error: {e}. Try: 1) check if your title is valid, or 2) re-authenticate if you see auth errors."
 
 
-class FinalAnswerTool(Tool):
-    """Tool for when the agent has enough info and just wants to respond directly."""
-    name = "final_answer"
-    description = (
-        "Return a final answer to the user. This is the ONLY way to end the agent's execution "
-        "loop. You MUST call this when you have finished your task. The content parameter "
-        "should contain your complete, well-organized answer to the user's original question."
-    )
-    inputs = {
-        "content": {"type": "string", "description": "Your response to the user"},
-    }
-    output_type = "string"
-
-    def forward(self, content: str) -> str:
-        return content
-
-
 # Tool groups for different agent types
 RESEARCH_TOOLS = [DeepResearchTool, AskNotebookTool, AddSourceTool, ListSourcesTool, CreateNotebookTool]
 PODCAST_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GeneratePodcastTool]
@@ -347,5 +330,5 @@ MINDMAP_TOOLS = [AskNotebookTool, AddSourceTool, ListSourcesTool, GenerateMindMa
 ALL_TOOLS = [
     DeepResearchTool, AskNotebookTool, GeneratePodcastTool, GenerateVideoTool,
     GenerateQuizTool, GenerateMindMapTool, GenerateReportTool,
-    AddSourceTool, ListSourcesTool, CreateNotebookTool, FinalAnswerTool,
+    AddSourceTool, ListSourcesTool, CreateNotebookTool,
 ]
