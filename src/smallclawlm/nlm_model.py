@@ -76,17 +76,10 @@ class NLMModel(Model):
         self._client = NotebookLMClient(self._auth)
         await self._client.__aenter__()
 
-        # Set concise mode for faster agent loops
-        if self._concise:
-            try:
-                from notebooklm.types import ChatMode
-                await self._client.chat.set_mode(ChatMode.CONCISE)
-                logger.debug("Set chat mode to CONCISE")
-            except (AttributeError, Exception) as e:
-                logger.debug(f"Could not set concise mode: {e}")
+
 
     async def _ensure_notebook(self):
-        """Ensure we have a notebook ID."""
+        """Ensure we have a notebook ID and chat mode is set."""
         await self._ensure_client()
         if self._notebook_id is not None:
             return
@@ -95,6 +88,9 @@ class NLMModel(Model):
         nb = await self._client.notebooks.create(self._notebook_title)
         self._notebook_id = nb.id
         logger.info(f"Auto-created notebook: {nb.id} ({nb.title})")
+
+        # NOTE: ChatMode.CONCISE breaks chat.ask() (timeout/parse failure)
+        # Using DEFAULT mode which works reliably.
 
     async def _chat_with_retry(self, question: str) -> str:
         """Call chat.ask() with exponential backoff for rate limits."""
@@ -107,7 +103,11 @@ class NLMModel(Model):
                     question,
                     conversation_id=None,  # Always stateless
                 )
-                return result.answer if hasattr(result, "answer") else str(result)
+                answer = result.answer if hasattr(result, "answer") else str(result)
+                if not answer or not answer.strip():
+                    logger.warning(f"Empty answer from NotebookLM for prompt: {question[:200]}")
+                    return ""
+                return answer
 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -180,6 +180,15 @@ class NLMModel(Model):
             token_usage=TokenUsage(input_tokens=0, output_tokens=0),
         )
 
+    _CODING_INSTRUCTION = (
+        "IMPORTANT: When you need to use a tool, output a Python code block using this format:\n"
+        "<code>\n"
+        "tool_name(argument=value)\n"
+        "</code>\n"
+        "When you have the final answer, use: <code>final_answer(content=\"your answer\")</code>\n"
+        "Always wrap tool calls in <code> tags. Do not respond with plain text alone if a tool call is needed.\n"
+    )
+
     def _messages_to_prompt(self, messages: list[ChatMessage]) -> str:
         """Flatten smolagents message history into a single prompt string.
 
@@ -194,7 +203,7 @@ class NLMModel(Model):
             MessageRole.TOOL_CALL: "Action",
             MessageRole.TOOL_RESPONSE: "Observation",
         }
-        parts = []
+        parts = [self._CODING_INSTRUCTION]
         for msg in messages:
             label = role_labels.get(msg.role, str(msg.role))
             content = msg.content if isinstance(msg.content, str) else str(msg.content)

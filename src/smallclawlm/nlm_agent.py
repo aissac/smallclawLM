@@ -8,21 +8,15 @@ Usage:
     agent = NLMAgent(notebook_id="abc123", tools="research")
     result = agent.run("What are the latest fusion energy breakthroughs?")
 
-    # Podcast agent (different notebook, different tools)
-    agent = NLMAgent(notebook_id="xyz789", tools="podcast")
-    result = agent.run("Create a podcast about climate change")
-
-    # Custom tool set + system prompt
+    # Custom instructions
     agent = NLMAgent(
         notebook_id="abc123",
-        tools=[AskNotebookTool, AddSourceTool],
         instructions="You are a marine biology expert. Focus on ocean ecosystems.",
     )
 """
 
 import logging
 from smolagents import CodeAgent
-from smolagents.agents import PromptTemplates
 
 from smallclawlm.nlm_model import NLMModel
 from smallclawlm.nlm_tools import (
@@ -41,7 +35,7 @@ TOOL_PRESETS = {
     "all": ALL_TOOLS,
 }
 
-DEFAULT_SYSTEM_PROMPT = """You are a SmallClawLM agent powered by Google NotebookLM.
+DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by Google NotebookLM.
 You have access to notebook tools for research, content generation, and analysis.
 
 IMPORTANT RULES:
@@ -56,9 +50,6 @@ class NLMAgent:
 
     Uses NotebookLM's built-in Gemini as the reasoning engine.
     No external LLM API keys required.
-
-    Uses CodeAgent because NotebookLM outputs Python code blocks
-    naturally — no need to force structured JSON tool calls.
     """
 
     def __init__(
@@ -92,31 +83,21 @@ class NLMAgent:
             concise=True,
         )
 
-        # Build prompt templates with optional custom instructions
-        system_prompt = instructions or DEFAULT_SYSTEM_PROMPT
-        prompt_templates = PromptTemplates(
-            system_prompt=system_prompt,
-            planning={"initial_plan": "", "update_plan_pre": "", "update_plan_post": ""},
-            managed_agent={"task": "", "report": ""},
-            final_answer={"pre_messages": "", "post_messages": ""},
-        )
-
         self.agent = CodeAgent(
             model=model,
             tools=tool_instances,
-            prompt_templates=prompt_templates,
+            instructions=instructions or DEFAULT_INSTRUCTIONS,
             max_steps=max_steps,
             verbosity_level=verbosity_level,
             additional_authorized_imports=additional_authorized_imports or [],
             planning_interval=planning_interval,
         )
 
-        # Share notebook_id with tools so they operate on the same notebook
         self._model = model
         self._share_notebook_id()
 
     def _share_notebook_id(self):
-        """Propagate notebook_id to all tool instances after model creates notebook."""
+        """Propagate notebook_id to all tool instances."""
         if self._notebook_id:
             self._model._notebook_id = self._notebook_id
         for tool in self.agent.tools:
@@ -124,18 +105,11 @@ class NLMAgent:
                 tool._notebook_id = self._notebook_id
 
     def run(self, task: str, **kwargs) -> str:
-        """Run the agent on a task.
-
-        First call triggers lazy notebook creation and source upload.
-        """
-        # Ensure notebook exists before running
+        """Run the agent on a task."""
         self._model._run_async(self._model._ensure_notebook())
-
-        # Propagate the (possibly auto-created) notebook_id
         self._notebook_id = self._model._notebook_id
         self._share_notebook_id()
 
-        # Upload any initial sources
         if self._upload_sources:
             self._upload_initial_sources()
 
@@ -162,16 +136,7 @@ def create_agent(
     notebook_id: str | None = None,
     **kwargs,
 ) -> NLMAgent:
-    """Factory function to create a specialized agent.
-
-    Args:
-        specialty: One of "research", "podcast", "quiz", "report", "mindmap"
-        notebook_id: Existing notebook ID (auto-creates if None)
-        **kwargs: Additional args passed to NLMAgent
-
-    Returns:
-        Configured NLMAgent ready to run
-    """
+    """Factory function to create a specialized agent."""
     return NLMAgent(
         notebook_id=notebook_id,
         tools=specialty,
