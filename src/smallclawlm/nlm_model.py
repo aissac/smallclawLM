@@ -1,24 +1,24 @@
-"""NLMModel — NotebookLM chat-backed smolagents Model for the slow path.
+"""NLMModel - NotebookLM chat-backed smolagents Model for the slow path.
 
 When the router classifies input as needing reasoning (conversational,
 analytical, multi-step), NLMAgent uses this model. It sends the full
-smolagents message history to NotebookLM's chat API and parses the
-response for <code> blocks that the CodeAgent can execute.
+smolagents message history to NotebookLM chat API and parses the
+response for tool calls or final answers.
 
 This is the "brain" of the slow path. The fast path bypasses this entirely,
 going straight to Pipeline / direct tool calls.
 
 Architecture:
-  Fast path:  user input → router → Pipeline → direct API call → result
-  Slow path:  user input → router → NLMAgent → NLMModel.generate() → chat.ask()
-              → parse response → CodeAgent executes tools → result
+  Fast path:  user input -> router -> Pipeline -> direct API call -> result
+  Slow path:  user input -> router -> NLMAgent -> NLMModel.generate() -> chat.ask()
+              -> parse response -> CodeAgent executes tools -> result
 
 Key design decisions:
 - Stateless: no conversation_id reuse (avoids sync drift)
-- ChatMode.CONCISE for faster responses
-- Coding persona injected to coax Python code blocks from NotebookLM
 - Daemon thread event loop for async/sync bridge
-- Error → string conversion so agent can self-correct
+- Error -> string conversion so agent can self-correct
+- Handles list content in smolagents messages (step 2+)
+- Truncates long prompts to 10K chars for NotebookLM limits
 """
 
 import asyncio
@@ -38,7 +38,7 @@ class NLMModel(Model):
     """smolagents Model backed by NotebookLM chat API.
 
     Used only in the slow path (NLMAgent). The fast path calls
-    NotebookLM tools directly via Pipeline — no model involved.
+    NotebookLM tools directly via Pipeline - no model involved.
     """
 
     def __init__(
@@ -111,23 +111,43 @@ class NLMModel(Model):
 
         Flattens smolagents message history into a single prompt,
         sends it to NotebookLM, and returns the response.
-        The CodeAgent will parse <code> blocks from the response.
+        The CodeAgent will parse the response for tool calls or final answers.
         """
         # Flatten message history into a single prompt
+        # smolagents messages can have content as str or list[dict]
         prompt_parts = []
         for msg in messages:
+            content = msg.content
+            # Handle list content (smolagents sends dicts for tool results)
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item) if isinstance(item, str) else str(item)
+                    for item in content
+                )
+            content = str(content) if content else ""
+
+            if not content:
+                continue
+
             if msg.role == MessageRole.SYSTEM:
-                prompt_parts.append(f"[System] {msg.content}")
+                prompt_parts.append(f"[System] {content}")
             elif msg.role == MessageRole.USER:
-                prompt_parts.append(f"[User] {msg.content}")
+                prompt_parts.append(f"[User] {content}")
             elif msg.role == MessageRole.ASSISTANT:
                 # Truncate long assistant messages to avoid token bloat
-                content = msg.content[:500] if len(msg.content) > 500 else msg.content
-                prompt_parts.append(f"[Assistant] {content}")
+                truncated = content[:500] if len(content) > 500 else content
+                prompt_parts.append(f"[Assistant] {truncated}")
             else:
-                prompt_parts.append(msg.content)
+                prompt_parts.append(content)
 
-        full_prompt = "\n\n".join(prompt_parts)
+        if not prompt_parts:
+            full_prompt = "[User] Please respond."
+        else:
+            full_prompt = "\n\n".join(prompt_parts)
+
+        # Truncate total prompt to avoid NotebookLM token limits
+        if len(full_prompt) > 10000:
+            full_prompt = full_prompt[:10000] + "\n[...truncated]"
 
         # Run async chat in the daemon loop
         loop = self._ensure_loop()
@@ -136,10 +156,14 @@ class NLMModel(Model):
             response = future.result(timeout=60)
         except Exception as e:
             logger.error(f"Generate error: {e}")
-            response = f"final_answer(\"Error: {e}\")"
+            response = 'final_answer("Error: ' + str(e) + '")'
+
+        # If NotebookLM returned empty/error, return a fallback
+        if not response or response.strip() == "" or response.startswith("[ERROR]"):
+            response = 'final_answer("I could not get a response from NotebookLM. Please try rephrasing your request.")'
 
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=response,
-            token_usage=TokenUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            token_usage=TokenUsage(input_tokens=0, output_tokens=0),
         )
