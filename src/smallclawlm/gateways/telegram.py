@@ -53,13 +53,11 @@ class TelegramGateway:
     def __init__(
         self,
         token: str,
-        model_backend: str = "smollm",
         max_steps: int = 10,
         n_ctx: int = 2048,
         n_threads: int = 4,
     ):
         self.token = token
-        self.model_backend = model_backend
         self.max_steps = max_steps
         self.n_ctx = n_ctx
         self.n_threads = n_threads
@@ -221,7 +219,6 @@ class TelegramGateway:
                     notebook_id=notebook_id,
                     tools="all",
                     max_steps=self.max_steps,
-                    model_backend=self.model_backend,
                     n_ctx=self.n_ctx,
                     n_threads=self.n_threads,
                 )

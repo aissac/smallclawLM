@@ -156,7 +156,6 @@ async def _slow_nlm_path(task: str, notebook_id: str | None, max_steps: int = 10
         notebook_id=notebook_id,
         tools="all",
         max_steps=max_steps,
-        model_backend="nlm",
     )
     return agent.run(task)
 
@@ -169,7 +168,6 @@ def _slow_path(task: str, notebook_id: str | None, max_steps: int = 10, model_ba
         notebook_id=notebook_id,
         tools="all",
         max_steps=max_steps,
-        model_backend=model_backend,
     )
     return agent.run(task)
 
@@ -292,8 +290,6 @@ def agent(notebook_id, max_steps, model_backend, verbose):
         notebook_id=notebook_id,
         tools="all",
         max_steps=max_steps,
-        model_backend=model_backend,
-        verbosity_level=2 if verbose else 1,
     )
 
     model_label = "SmolLM3 (local)" if model_backend == "smollm" else "NotebookLM (cloud)"
@@ -414,12 +410,10 @@ def list_sources(notebook_id):
 
 @cli.command()
 @click.option("--token", "-t", envvar="TELEGRAM_BOT_TOKEN", help="Telegram bot token")
-@click.option("--model", "model_backend", type=click.Choice(["smollm", "nlm"]), default="smollm",
-              help="Model backend: smollm (local) or nlm (cloud)")
 @click.option("--max-steps", "-m", default=10, help="Max agent steps")
 @click.option("--n-threads", default=4, help="SmolLM3 threads (optimal: 4)")
 @click.option("--n-ctx", default=2048, help="SmolLM3 context window size")
-def serve(token, model_backend, max_steps, n_threads, n_ctx):
+def serve(token, max_steps, n_threads, n_ctx):
     """Start a Telegram bot gateway.
 
     Set TELEGRAM_BOT_TOKEN env var or pass --token.
@@ -437,12 +431,11 @@ def serve(token, model_backend, max_steps, n_threads, n_ctx):
 
     gateway = TelegramGateway(
         token=token,
-        model_backend=model_backend,
         max_steps=max_steps,
         n_threads=n_threads,
         n_ctx=n_ctx,
     )
-    click.echo(f"SmallClawLM Telegram gateway starting (model={model_backend})...")
+    click.echo("SmallClawLM Telegram gateway starting...")
     gateway.run(block=True)
 
 

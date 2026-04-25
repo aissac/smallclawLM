@@ -97,6 +97,7 @@ class NLMAgent:
         n_threads: int = 4,
         n_ctx: int = 2048,
         n_gpu_layers: int = 0,
+        max_steps: int = 10,
     ):
         self._notebook_id = notebook_id
         self._notebook_title = notebook_title or "SmallClawLM Agent"
@@ -137,6 +138,7 @@ class NLMAgent:
             additional_authorized_imports=additional_authorized_imports or [],
             planning_interval=planning_interval,
         )
+        self._max_steps = max_steps
 
     @property
     def memory(self) -> NLMMemory:
@@ -163,7 +165,7 @@ class NLMAgent:
         4. Auto-syncs results to memory
         """
         try:
-            result = self._agent.run(task, **kwargs)
+            result = self._agent.run(task, max_steps=self._max_steps, **kwargs)
             # Auto-sync the result to memory
             if result:
                 self._memory.add_observation("agent_result", str(result)[:500])
