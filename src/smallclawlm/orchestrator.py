@@ -14,6 +14,11 @@ The orchestrator decides which layer handles each generate() call:
 The key insight: The agent doesn't "call" NotebookLM as an external service.
 NotebookLM IS its memory and reasoning. Every generate() has memory context
 injected. Every answer can escalate to cognition. Every result auto-syncs.
+
+NotebookRouter integration:
+  When no notebook_id is provided, the Orchestrator uses NotebookRouter
+  to automatically select the best notebook based on the query topic.
+  This means `smallclaw run "research fusion"` Just Works — no manual -n flag.
 """
 
 import logging
@@ -25,6 +30,7 @@ from smolagents.monitoring import TokenUsage
 
 from smallclawlm.nlm_memory import NLMMemory
 from smallclawlm.smollm_model import SmolLMModel
+from smallclawlm.notebook_router import NotebookRouter
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,8 @@ class OrchestratorModel(Model):
 
     The agent never "decides" to use NotebookLM — the orchestrator handles
     escalation transparently. SmolLM3 sees memory context in every prompt.
+
+    If no notebook_id is given, NotebookRouter picks the best one automatically.
     """
 
     def __init__(
@@ -61,18 +69,37 @@ class OrchestratorModel(Model):
             n_gpu_layers=n_gpu_layers,
         )
 
+        # NotebookRouter for automatic notebook selection
+        self._router = NotebookRouter()
+        self._routed_notebook_id: str | None = None
+
         # Layer 3: MEMORY (NotebookLM-backed persistence)
         if memory is not None:
             self._memory = memory
+            self._notebook_id = memory.notebook_id or notebook_id
         else:
-            self._memory = NLMMemory(notebook_id=notebook_id)
+            self._notebook_id = notebook_id
+            self._memory = NLMMemory(notebook_id=self._notebook_id)
 
-        self._notebook_id = notebook_id
+    def _resolve_notebook_id(self, query: str | None = None) -> str | None:
+        """Resolve notebook_id, using router if none provided.
 
-    @property
-    def memory(self) -> NLMMemory:
-        """Access the agent's persistent memory."""
-        return self._memory
+        If notebook_id is already set, use it directly.
+        If not, use NotebookRouter to pick the best one based on the query.
+        """
+        if self._notebook_id:
+            return self._notebook_id
+
+        if query:
+            result = self._router.route_sync(query)
+            logger.info(f"Router selected notebook '{result.title}' (score={result.score:.2f}, {result.match_level})")
+            self._notebook_id = result.notebook_id
+            self._routed_notebook_id = result.notebook_id
+            # Update memory to use the routed notebook
+            self._memory.notebook_id = result.notebook_id
+            return result.notebook_id
+
+        return None
 
     def generate(
         self,
@@ -84,11 +111,16 @@ class OrchestratorModel(Model):
         """Generate with automatic memory injection and cognition escalation.
 
         Flow:
-        1. Inject memory context into the prompt (Layer 3 → Layer 1)
-        2. SmolLM3 generates response (Layer 1: REFLEX)
-        3. If response indicates knowledge gap, auto-escalate to Layer 2
-        4. Auto-sync result to memory (Layer 1 → Layer 3)
+        1. Resolve notebook_id via router if needed
+        2. Inject memory context into the prompt (Layer 3 → Layer 1)
+        3. SmolLM3 generates response (Layer 1: REFLEX)
+        4. If response indicates knowledge gap, auto-escalate to Layer 2
+        5. Auto-sync result to memory (Layer 1 → Layer 3)
         """
+        # Step 0: Auto-resolve notebook if not set
+        query = self._extract_query(messages)
+        self._resolve_notebook_id(query)
+
         # Step 1: Inject memory context
         enriched_messages = self._inject_memory(messages)
 
@@ -201,4 +233,5 @@ class OrchestratorModel(Model):
                 break
 
     def __repr__(self):
-        return f"OrchestratorModel(reflex=SmolLM3, memory=NLMMemory(nb={self._memory.notebook_id}))"
+        nb = self._notebook_id or "auto"
+        return f"OrchestratorModel(reflex=SmolLM3, memory=NLMMemory(nb={nb}))"

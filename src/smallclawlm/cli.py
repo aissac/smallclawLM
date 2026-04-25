@@ -24,6 +24,7 @@ import logging
 import sys
 
 from smallclawlm.router import route, Path as RoutePath
+from smallclawlm.notebook_router import NotebookRouter
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,6 +43,29 @@ def _run_async(coro):
             return pool.submit(lambda: asyncio.run(coro)).result()
     else:
         return asyncio.run(coro)
+
+
+
+def _resolve_notebook(notebook_id: str | None, query: str | None = None) -> str | None:
+    """Auto-resolve notebook_id using NotebookRouter when not provided.
+
+    When --notebook-id / -n is not given, the router picks the best notebook
+    based on the query topic using Jaccard similarity + source richness + recency.
+    """
+    if notebook_id:
+        return notebook_id
+    if not query:
+        return None
+    try:
+        router = NotebookRouter()
+        result = router.route_sync(query)
+        click.echo(f"Auto-selected notebook: {result.title} (score={result.score:.2f}, {result.match_level})", err=True)
+        if result.created_new:
+            click.echo(f"Created new notebook: {result.title} ({result.notebook_id})", err=True)
+        return result.notebook_id
+    except Exception as e:
+        click.echo(f"Warning: notebook routing failed ({e}), using first available", err=True)
+        return None
 
 
 # ─── Fast Path: Direct Pipeline Execution ───
@@ -208,6 +232,10 @@ def run(task, notebook_id, max_steps, model_backend, force_slow, force_fast, ver
         click.echo("Error: cannot use both --force-fast and --force-slow", err=True)
         sys.exit(1)
 
+    # Auto-resolve notebook if not specified
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, task)
+
     # Route the task
     result = route(task)
 
@@ -229,6 +257,8 @@ def run(task, notebook_id, max_steps, model_backend, force_slow, force_fast, ver
 
     # Execute
     if result.path == RoutePath.FAST:
+        if not notebook_id:
+            notebook_id = _resolve_notebook(None, task)
         if verbose:
             click.echo(f"Fast path: {result.intent}")
         output = _run_async(_fast_path(result.intent, result.params, notebook_id))
@@ -254,6 +284,9 @@ def agent(notebook_id, max_steps, model_backend, verbose):
       nlm: NotebookLM chat API (requires auth)
     """
     from smallclawlm import NLMAgent
+
+    if not notebook_id:
+        notebook_id = _resolve_notebook(None, "interactive session")
 
     nlm_agent = NLMAgent(
         notebook_id=notebook_id,

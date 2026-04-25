@@ -16,9 +16,11 @@ from smallclawlm.nlm_memory import NLMMemory
 from smallclawlm.nlm_agent import NLMAgent, create_agent
 from smallclawlm.smollm_model import SmolLMModel
 from smallclawlm.nlm_model import NLMModel
+from smallclawlm.notebook_router import NotebookRouter, RouteResult
 
 __all__ = [
     "OrchestratorModel", "NLMMemory",
     "NLMAgent", "create_agent",
     "SmolLMModel", "NLMModel",
+    "NotebookRouter", "RouteResult",
 ]
