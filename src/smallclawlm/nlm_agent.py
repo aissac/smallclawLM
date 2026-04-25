@@ -1,22 +1,21 @@
-"""NLMAgent — Slow-path agent backed by NotebookLM chat API.
+"""NLMAgent — Hybrid agent with fast/slow path routing.
 
-Used when the router classifies input as needing reasoning (conversational,
-analytical, multi-step). The fast path bypasses this entirely, going
-straight to Pipeline / direct tool calls.
+Fast path: Direct Pipeline calls (no LLM).
+Slow path: CodeAgent with local SmolLM3 executor + NotebookLM knowledge tools.
 
 Architecture:
   Fast path:  user input → router → Pipeline → direct API call → result
-  Slow path:  user input → router → NLMAgent → NLMModel.generate() → chat.ask()
-              → CodeAgent executes tools → result
+  Slow path:  user input → router → NLMAgent → SmolLMModel.generate()
+              → <code>tool_call()</code> → CodeAgent executes tools → result
 
-One agent = one notebook. The notebook's sources define its specialty.
-No external LLM API keys needed — all reasoning runs through Gemini inside NotebookLM.
+The slow path uses SmolLM3-3B as the "hands" (executor that decides which
+tools to call) and NotebookLM as the "brain" (domain knowledge via tools).
+All inference is local — zero external tokens required.
 """
 
 import logging
 from smolagents import CodeAgent
 
-from smallclawlm.nlm_model import NLMModel
 from smallclawlm.nlm_tools import (
     ALL_TOOLS, RESEARCH_TOOLS, PODCAST_TOOLS, QUIZ_TOOLS,
     REPORT_TOOLS, MINDMAP_TOOLS,
@@ -33,7 +32,7 @@ TOOL_PRESETS = {
     "all": ALL_TOOLS,
 }
 
-DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by Google NotebookLM.
+DEFAULT_INSTRUCTIONS = """You are a SmallClawLM agent powered by local SmolLM3 and Google NotebookLM.
 You have access to notebook tools for research, content generation, and analysis.
 
 IMPORTANT RULES:
@@ -42,13 +41,14 @@ IMPORTANT RULES:
 3. If a tool returns an error, read the suggested fix and try again.
 4. Always call final_answer() when done — it is the ONLY way to end execution.
 5. Keep your code blocks simple — one tool call per block.
+6. When calling tools, use exact parameter names from the tool descriptions.
 """
 
 
 class NLMAgent:
     """One agent, one notebook, one specialty.
 
-    Uses NotebookLM's built-in Gemini as the reasoning engine.
+    Uses SmolLM3 (local) as the executor and NotebookLM tools as knowledge.
     No external LLM API keys required.
     """
 
@@ -63,6 +63,12 @@ class NLMAgent:
         max_steps: int = 10,
         verbosity_level: int = 1,
         upload_sources: list[str] | None = None,
+        # Model configuration
+        model_backend: str = "smollm",
+        model_path: str | None = None,
+        model_n_ctx: int = 4096,
+        model_n_gpu_layers: int = -1,
+        model_temperature: float = 0.3,
     ):
         self._notebook_id = notebook_id
         self._upload_sources = upload_sources or []
@@ -75,12 +81,25 @@ class NLMAgent:
 
         tool_instances = [cls() for cls in tool_classes]
 
-        # Create model pointing to this notebook
-        model = NLMModel(
-            notebook_id=notebook_id,
-            notebook_title=notebook_title or "SmallClawLM Agent",
-            auto_create=True,
-        )
+        # Create model based on backend choice
+        model_backend = model_backend.lower()
+        if model_backend == "smollm":
+            from smallclawlm.smollm_model import SmolLMModel
+            model = SmolLMModel(
+                model_path=model_path,
+                n_ctx=model_n_ctx,
+                n_gpu_layers=model_n_gpu_layers,
+                temperature=model_temperature,
+            )
+        elif model_backend == "nlm":
+            from smallclawlm.nlm_model import NLMModel
+            model = NLMModel(
+                notebook_id=notebook_id,
+                notebook_title=notebook_title or "SmallClawLM Agent",
+                auto_create=True,
+            )
+        else:
+            raise ValueError(f"Unknown model backend: {model_backend}. Use 'smollm' or 'nlm'.")
 
         self.agent = CodeAgent(
             model=model,
