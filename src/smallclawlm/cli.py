@@ -411,5 +411,40 @@ def list_sources(notebook_id):
     click.echo(output)
 
 
+
+@cli.command()
+@click.option("--token", "-t", envvar="TELEGRAM_BOT_TOKEN", help="Telegram bot token")
+@click.option("--model", "model_backend", type=click.Choice(["smollm", "nlm"]), default="smollm",
+              help="Model backend: smollm (local) or nlm (cloud)")
+@click.option("--max-steps", "-m", default=10, help="Max agent steps")
+@click.option("--n-threads", default=4, help="SmolLM3 threads (optimal: 4)")
+@click.option("--n-ctx", default=2048, help="SmolLM3 context window size")
+def serve(token, model_backend, max_steps, n_threads, n_ctx):
+    """Start a Telegram bot gateway.
+
+    Set TELEGRAM_BOT_TOKEN env var or pass --token.
+    The bot auto-selects notebooks based on message content.
+    """
+    if not token:
+        click.echo("Error: TELEGRAM_BOT_TOKEN required. Set env var or pass --token.", err=True)
+        sys.exit(1)
+
+    try:
+        from smallclawlm.gateways.telegram import TelegramGateway
+    except ImportError:
+        click.echo("Error: python-telegram-bot not installed. Install with: pip install smallclawlm[telegram]", err=True)
+        sys.exit(1)
+
+    gateway = TelegramGateway(
+        token=token,
+        model_backend=model_backend,
+        max_steps=max_steps,
+        n_threads=n_threads,
+        n_ctx=n_ctx,
+    )
+    click.echo(f"SmallClawLM Telegram gateway starting (model={model_backend})...")
+    gateway.run(block=True)
+
+
 if __name__ == "__main__":
     cli()
